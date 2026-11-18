@@ -263,14 +263,16 @@ impl Parser<'_> {
 
     fn parse_parenthesized_expression(&mut self) -> Option<CompletedMarker> {
         let parenthesized = self.start();
+        let tuple = self.parentheses_contain_comma(self.logical_position());
         self.bump();
         self.skip_newlines();
         if self.eat(TokenKind::RightParen) {
             return Some(self.complete(parenthesized, SyntaxKind::UnitExpr));
         }
-        self.parse_expression(true, true);
+        self.parse_expression(!tuple, true);
         self.skip_newlines();
-        if self.eat(TokenKind::Comma) {
+        if tuple || self.at(TokenKind::Comma) {
+            self.expect(TokenKind::Comma);
             self.skip_newlines();
             while !self.at(TokenKind::RightParen) && !self.at_eof() && !self.halted() {
                 self.parse_expression(false, true);
@@ -280,12 +282,36 @@ impl Parser<'_> {
                 }
                 self.skip_newlines();
             }
+            if tuple && !self.at(TokenKind::RightParen) && !self.halted() {
+                self.error_current(SyntaxDiagnosticKind::ParseUnexpectedToken);
+            }
             self.expect_closing(TokenKind::RightParen);
             Some(self.complete(parenthesized, SyntaxKind::TupleExpr))
         } else {
             self.expect_closing(TokenKind::RightParen);
             Some(self.complete(parenthesized, SyntaxKind::GroupExpr))
         }
+    }
+
+    fn parentheses_contain_comma(&mut self, opening: usize) -> bool {
+        let Some(close) = self.matching_delimiter(opening) else {
+            return false;
+        };
+        let mut position = opening + 1;
+        while position < close {
+            match self.kind_at_logical(position) {
+                Some(TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace) => {
+                    let Some(nested_close) = self.matching_delimiter(position) else {
+                        return false;
+                    };
+                    position = nested_close + 1;
+                }
+                Some(TokenKind::Comma) => return true,
+                Some(_) => position += 1,
+                None => return false,
+            }
+        }
+        false
     }
 
     fn parse_bracket_collection_expression(&mut self) -> Option<CompletedMarker> {
