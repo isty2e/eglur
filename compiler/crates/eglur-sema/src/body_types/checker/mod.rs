@@ -238,6 +238,7 @@ fn typecheck_bodies_inner<'hir>(
         regions: FactTable::new(),
         checked_numeric: FactTable::new(),
         ownership_operations: FactTable::new(),
+        carrier_arms: BTreeMap::new(),
         bodies: FactTable::new(),
         transfers: Vec::new(),
         callable_instances: Vec::new(),
@@ -285,6 +286,7 @@ struct BodyChecker<'input, 'hir, 'support> {
     regions: FactTable<ControlRegionKey, ControlRegion>,
     checked_numeric: FactTable<ExpressionKey, CheckedNumericOperation>,
     ownership_operations: FactTable<ExpressionKey, TypedOwnershipOperation>,
+    carrier_arms: BTreeMap<ExpressionKey, Box<[CarrierArm]>>,
     bodies: FactTable<DefId, BodyTypeSummary>,
     transfers: Vec<ControlTransfer>,
     callable_instances: Vec<CallableInstance>,
@@ -547,6 +549,14 @@ struct ConstructorTarget {
 struct PatternCheck {
     coverage: PatternCoverage,
     irrefutable: bool,
+    partial_variant: Option<CanonicalTarget>,
+    binding: Option<RootPatternBinding>,
+}
+
+#[derive(Clone, Copy)]
+enum RootPatternBinding {
+    Whole(LocalBindingId),
+    Payload(LocalBindingId),
 }
 
 impl PatternCheck {
@@ -557,6 +567,8 @@ impl PatternCheck {
                 variants: BTreeSet::new(),
             },
             irrefutable: true,
+            partial_variant: None,
+            binding: None,
         }
     }
 
@@ -567,7 +579,14 @@ impl PatternCheck {
                 variants: BTreeSet::new(),
             },
             irrefutable: false,
+            partial_variant: None,
+            binding: None,
         }
+    }
+
+    fn bind_whole(mut self, binding: LocalBindingId) -> Self {
+        self.binding = Some(RootPatternBinding::Whole(binding));
+        self
     }
 
     fn merge(&mut self, other: Self) {
@@ -577,20 +596,44 @@ impl PatternCheck {
         self.irrefutable &= other.irrefutable;
         self.coverage.total = self.irrefutable;
         self.coverage.variants.clear();
+        self.partial_variant = None;
+        self.binding = None;
     }
 
     fn variant(declaration: CanonicalTarget, payload: Self) -> Self {
-        Self {
-            coverage: PatternCoverage {
-                total: false,
-                variants: if payload.irrefutable {
-                    BTreeSet::from([declaration])
-                } else {
-                    BTreeSet::new()
-                },
-            },
-            irrefutable: false,
+        let mut check = Self::partial();
+        if payload.irrefutable {
+            check.coverage.variants.insert(declaration);
+        } else {
+            check.partial_variant = Some(declaration);
         }
+        check
+    }
+
+    fn carrier_arm(
+        &self,
+        [present, absent]: [&CanonicalTarget; 2],
+        covered: &BTreeSet<CanonicalTarget>,
+    ) -> Option<CarrierArm> {
+        let target = self
+            .coverage
+            .variants
+            .first()
+            .or(self.partial_variant.as_ref());
+        if !self.coverage.total && target != Some(present) && target != Some(absent) {
+            return None;
+        }
+        let may_select_present =
+            !covered.contains(present) && (self.coverage.total || target == Some(present));
+        let binding = match self.binding {
+            Some(RootPatternBinding::Whole(id)) => Some(id),
+            Some(RootPatternBinding::Payload(id)) if target == Some(present) => Some(id),
+            _ => None,
+        };
+        Some(CarrierArm {
+            may_select_present,
+            binding,
+        })
     }
 }
 

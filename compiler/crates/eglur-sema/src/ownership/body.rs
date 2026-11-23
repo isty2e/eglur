@@ -9,6 +9,7 @@ use eglur_hir::{
     ReduceBySingleValue, StmtId, StmtKind,
 };
 
+use crate::body_types::CarrierArm;
 use crate::{
     BodyTypes, ControlRegionKey, ControlTransfer, ControlTransferSource, DeclarationSignatures,
     DefId, ExpressionKey, FactState, IfBranch, LocalBindingId, ModuleId, NameResolution,
@@ -17,6 +18,7 @@ use crate::{
 };
 
 use super::analysis::OwnershipAnalysisError;
+use super::model::OwnershipCause;
 use super::{
     OwnershipAvailability, OwnershipBodyStatus, OwnershipBodySummary, OwnershipFailure,
     OwnershipFailureKind, OwnershipRootFact,
@@ -170,6 +172,8 @@ pub(crate) fn analyze_body(
         operation_count: 0,
         unperformed: false,
         recoverable_exits: Vec::new(),
+        tentative: BTreeSet::new(),
+        pending_payloads: Vec::new(),
     };
     let mut state = FlowState::default();
     for parameter in parameters {
@@ -285,6 +289,8 @@ struct BodyAnalyzer<'analysis> {
     operation_count: usize,
     unperformed: bool,
     recoverable_exits: Vec<(ControlRegionKey, RecoverableExits)>,
+    tentative: BTreeSet<LocalBindingId>,
+    pending_payloads: Vec<(ControlRegionKey, OriginId)>,
 }
 
 impl BodyAnalyzer<'_> {
@@ -303,7 +309,9 @@ impl BodyAnalyzer<'_> {
                 self.consume_source(operation.source(), origin, state);
             }
             TypedOwnershipOperationKind::Move | TypedOwnershipOperationKind::DropOwn => {
-                self.consume_root(operation.source(), origin, state);
+                if !self.reject_tentative_use(operation.source(), origin) {
+                    self.consume_root(operation.source(), origin, state);
+                }
             }
         }
         let continuing = !matches!(
@@ -327,6 +335,7 @@ impl BodyAnalyzer<'_> {
         let Some(binding) = self.expression_local(expression)? else {
             return Ok(ExpressionFlow::continuing());
         };
+        self.reject_tentative_use(binding, origin);
         self.use_binding(binding, origin, state);
         let provenance = if self.binding_contains_reference(binding)? {
             state.alias(binding).cloned().unwrap_or_default()
@@ -337,6 +346,20 @@ impl BodyAnalyzer<'_> {
             continuing: true,
             provenance,
         })
+    }
+
+    fn reject_tentative_use(&mut self, binding: LocalBindingId, origin: OriginId) -> bool {
+        if !self.tentative.contains(&binding) {
+            return false;
+        }
+        self.failures.push(OwnershipFailure::new(
+            self.owner,
+            OwnershipFailureKind::GuardConsume,
+            origin,
+            binding,
+            None,
+        ));
+        true
     }
 
     fn retain_in_flight(
@@ -593,6 +616,10 @@ impl BodyAnalyzer<'_> {
                 ExprKind::Name(_) => {
                     if let Some(binding) = self.named_root(id)? {
                         let origin = expression.origin();
+                        if self.tentative.contains(&binding) {
+                            // The value occurrence already reported the guard-specific diagnostic.
+                            continue;
+                        }
                         self.failures.push(OwnershipFailure::new(
                             self.owner,
                             OwnershipFailureKind::TransferRequiresMove,
@@ -649,6 +676,18 @@ impl BodyAnalyzer<'_> {
         }
     }
 
+    fn tentative_place(
+        &self,
+        expression: ExprId,
+    ) -> Result<Option<LocalBindingId>, OwnershipAnalysisError> {
+        if self.tentative.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .named_root(expression)?
+            .filter(|id| self.tentative.contains(id)))
+    }
+
     fn check_side_exits(&mut self, key: ExpressionKey, origin: OriginId, state: &FlowState) {
         let source = ControlTransferSource::Expression(key);
         let body_types = self.body_types;
@@ -692,13 +731,28 @@ impl BodyAnalyzer<'_> {
         state: &FlowState,
     ) -> BTreeSet<LocalBindingId> {
         // Region order must not replace binding order when several regions exit.
-        let bindings = transfer
-            .exited_regions()
-            .iter()
-            .filter_map(|region| self.locals_by_region.get(region))
-            .flatten()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let mut bindings = BTreeSet::new();
+        let pending = self
+            .pending_payloads
+            .last()
+            .filter(|_| !matches!(transfer.kind(), crate::ControlTransferKind::MatchGuardFalse));
+        for region in transfer.exited_regions() {
+            if let Some(locals) = self.locals_by_region.get(region) {
+                bindings.extend(locals.iter().copied());
+            }
+            // An edge leaving any pending payload necessarily leaves the innermost one.
+            if let Some((guard, scrutinee)) = pending
+                && guard == region
+            {
+                self.failures.push(OwnershipFailure::at(
+                    self.owner,
+                    origin,
+                    OwnershipCause::PendingMatchExit {
+                        scrutinee: *scrutinee,
+                    },
+                ));
+            }
+        }
         for &binding in &bindings {
             let fact = state.availability(binding);
             if self.roots.contains_key(&binding) && fact.state != OwnershipAvailability::Consumed {

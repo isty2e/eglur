@@ -6,6 +6,7 @@ use eglur_source::{ByteOffset, ByteRange, FileSpan};
 use crate::diagnostic::record_type_error_with_related;
 use crate::{DeclarationCollection, LocalBindingId, NameResolution, SemanticSource};
 
+use super::model::OwnershipCause;
 use super::{OwnershipAnalysisError, OwnershipFailure, OwnershipFailureKind};
 
 pub(crate) fn emit_ownership_diagnostics(
@@ -105,11 +106,47 @@ fn resolve_failure(
     } else {
         span
     };
-    let name = local_names
-        .get(&failure.binding())
-        .map(String::as_str)
-        .unwrap_or("<ownership root>");
-    let (code, message) = match failure.kind() {
+    let (code, message, related_site) = match failure.cause() {
+        OwnershipCause::Binding { kind, binding, first_consume } => {
+            let name = local_names.get(&binding).map_or("<ownership root>", String::as_str);
+            let (code, message) = binding_diagnostic(kind, name);
+            let related = first_consume.map(|origin| (origin, "ownership value first consumed here"));
+            (code, message, related)
+        }
+        OwnershipCause::PendingMatchExit { scrutinee } => (
+            "OWNERSHIP_PATH_UNBALANCED",
+            "this guard exit leaves a possible ownership payload without discharging it exactly once on this path".to_owned(),
+            Some((scrutinee, "this match may still hold an ownership payload")),
+        ),
+        OwnershipCause::UnboundMatchPayload { scrutinee } => (
+            "OWNERSHIP_DISCARD_FORBIDDEN",
+            "ownership discard is forbidden: this arm can select a payload without binding it or its carrier".to_owned(),
+            Some((scrutinee, "ownership value matched here")),
+        ),
+    };
+    let related = if let Some((origin, label)) =
+        related_site.filter(|(origin, _)| *origin != failure.origin())
+    {
+        let related = source.origin_span(origin).cloned().ok_or(
+            OwnershipAnalysisError::MissingOriginSpan {
+                file: source.file(),
+                origin,
+            },
+        )?;
+        Some(RelatedSpan::new(related, label).expect("static related-span label is non-empty"))
+    } else {
+        None
+    };
+    Ok(ResolvedFailure {
+        code,
+        message,
+        span,
+        related,
+    })
+}
+
+fn binding_diagnostic(kind: OwnershipFailureKind, name: &str) -> (&'static str, String) {
+    match kind {
         OwnershipFailureKind::TransferRequiresMove => (
             "OWNERSHIP_TRANSFER_REQUIRES_MOVE",
             format!("ownership transfer of `{name}` requires move"),
@@ -128,30 +165,11 @@ fn resolve_failure(
                 "ownership path for `{name}` is not discharged exactly once before its obligation region exits"
             ),
         ),
-    };
-    let related = if let Some(origin) = failure
-        .related_origin()
-        .filter(|origin| *origin != failure.origin())
-    {
-        let related = source.origin_span(origin).cloned().ok_or(
-            OwnershipAnalysisError::MissingOriginSpan {
-                file: source.file(),
-                origin,
-            },
-        )?;
-        Some(
-            RelatedSpan::new(related, "ownership value first consumed here")
-                .expect("static related-span label is non-empty"),
-        )
-    } else {
-        None
-    };
-    Ok(ResolvedFailure {
-        code,
-        message,
-        span,
-        related,
-    })
+        OwnershipFailureKind::GuardConsume => (
+            "OWNERSHIP_GUARD_CONSUME_FORBIDDEN",
+            format!("ownership guard: forbidden to consume tentative binding `{name}`"),
+        ),
+    }
 }
 
 fn closing_delimiter_span(

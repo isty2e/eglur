@@ -202,7 +202,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     owners.bind(name.origin());
                 }
                 Ok(PatternPlan::Complete(Outcome::Known(
-                    PatternCheck::irrefutable(),
+                    PatternCheck::irrefutable().bind_whole(binding),
                 )))
             }
             PatternKind::Wildcard => Ok(PatternPlan::Complete(Outcome::Known(
@@ -566,7 +566,9 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 if let Outcome::Known(_) = &outcome {
                     self.pattern_bindings.type_binding(binding, expected)?;
                 }
-                Ok(PatternPlan::Complete(outcome))
+                Ok(PatternPlan::Complete(
+                    outcome.map(|check| check.bind_whole(binding)),
+                ))
             }
             PatternContinuation::Group => Ok(PatternPlan::Complete(outcome)),
             PatternContinuation::Tuple {
@@ -602,12 +604,18 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 let Outcome::Known(child) = outcome else {
                     return Ok(PatternPlan::Complete(outcome));
                 };
+                let payload_binding = match child.binding {
+                    Some(RootPatternBinding::Whole(id)) if templates.len() == 1 => {
+                        Some(RootPatternBinding::Payload(id))
+                    }
+                    _ => None,
+                };
                 check.merge(child);
 
                 let Some((pattern, type_index)) = cursor.next(templates.len()) else {
-                    return Ok(PatternPlan::Complete(Outcome::Known(
-                        PatternCheck::variant(declaration, check),
-                    )));
+                    let mut variant = PatternCheck::variant(declaration, check);
+                    variant.binding = payload_binding;
+                    return Ok(PatternPlan::Complete(Outcome::Known(variant)));
                 };
                 let expected = self
                     .signatures
@@ -674,12 +682,59 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         &mut self,
         source: &SemanticSource<'_>,
         scrutinee: TypeId,
-        arms: &[(&eglur_hir::MatchArm, PatternCoverage)],
-    ) -> Result<Outcome<()>, BodyFlow> {
-        let mut total = false;
+        arms: &[eglur_hir::MatchArm],
+        patterns: &[PatternCheck],
+    ) -> Result<Outcome<Option<Vec<CarrierArm>>>, BodyFlow> {
+        assert_eq!(arms.len(), patterns.len(), "all arms passed pattern typing");
+        let payloads = match self.signatures.types().ownership_root(scrutinee)? {
+            Some(crate::OwnershipRoot::Optional { payload }) => Some([Some(payload), None]),
+            Some(crate::OwnershipRoot::Result { payload, error }) => {
+                Some([Some(payload), Some(error)])
+            }
+            _ => None,
+        };
+        let mut impossible = [false; 2];
+        if let Some(payloads) = payloads {
+            let origin = self.pattern_origin(
+                source,
+                arms.first()
+                    .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?
+                    .pattern,
+            )?;
+            if !self.recorder.require(
+                CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
+                SemanticLocation::origin(source.file(), origin),
+            ) {
+                return Ok(Outcome::Unperformed);
+            }
+            for (impossible, payload) in impossible.iter_mut().zip(payloads) {
+                if let Some(ty) = payload {
+                    *impossible =
+                        self.inhabitance.classify(self.signatures, ty)? == Inhabitance::Uninhabited;
+                }
+            }
+        }
+
+        let universe = self.match_variant_universe(scrutinee)?;
+        let mut carrier_arms =
+            (payloads.is_some() && universe.is_some()).then(|| Vec::with_capacity(arms.len()));
+        let mut total = universe.is_some() && impossible == [true, true];
         let mut variants = BTreeSet::new();
-        for (arm, coverage) in arms {
+        if let Some(roles) = universe {
+            for (role, impossible) in roles.into_iter().zip(impossible) {
+                if impossible {
+                    variants.insert(role.clone());
+                }
+            }
+        }
+
+        for (arm, pattern) in arms.iter().zip(patterns) {
+            let coverage = &pattern.coverage;
             let unreachable = total
+                || pattern
+                    .partial_variant
+                    .as_ref()
+                    .is_some_and(|variant| variants.contains(variant))
                 || (!coverage.variants.is_empty()
                     && coverage
                         .variants
@@ -696,29 +751,41 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     )
                     .map(Outcome::Poisoned);
             }
+            if let (Some(roles), Some(facts)) = (universe, &mut carrier_arms) {
+                if let Some(fact) = pattern.carrier_arm(roles, &variants) {
+                    facts.push(fact);
+                } else {
+                    carrier_arms = None;
+                }
+            }
             if arm.guard.is_none() {
-                total |= coverage.total;
                 variants.extend(coverage.variants.iter().cloned());
+                total |= coverage.total
+                    || universe
+                        .is_some_and(|roles| roles.into_iter().all(|v| variants.contains(v)));
             }
         }
         if total {
-            return Ok(Outcome::Known(()));
+            return Ok(Outcome::Known(carrier_arms));
         }
-        let Some(universe) = self.match_variant_universe(scrutinee)? else {
+        let Some(universe) = universe else {
             let origin = arms
                 .first()
-                .map(|(arm, _)| self.pattern_origin(source, arm.pattern))
+                .map(|arm| self.pattern_origin(source, arm.pattern))
                 .transpose()?
                 .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
             self.demand_unimplemented(TypecheckCapability::AnalyzePatternCoverage, source, origin);
             return Ok(Outcome::Unperformed);
         };
-        if universe.iter().all(|variant| variants.contains(variant)) {
-            return Ok(Outcome::Known(()));
+        if universe
+            .into_iter()
+            .all(|variant| variants.contains(variant))
+        {
+            return Ok(Outcome::Known(carrier_arms));
         }
         let origin = arms
             .first()
-            .map(|(arm, _)| self.pattern_origin(source, arm.pattern))
+            .map(|arm| self.pattern_origin(source, arm.pattern))
             .transpose()?
             .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
         self.type_error(
@@ -734,14 +801,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     fn match_variant_universe(
         &self,
         scrutinee: TypeId,
-    ) -> Result<Option<BTreeSet<CanonicalTarget>>, BodyFlow> {
+    ) -> Result<Option<[&CanonicalTarget; 2]>, BodyFlow> {
         let TypeKind::Nominal { head, .. } = self.signatures.types().kind(scrutinee)? else {
             return Ok(None);
         };
-        let intrinsic = |left: LanguageItem, right: LanguageItem| {
-            let left = self.signatures.language_items().declaration(left)?.clone();
-            let right = self.signatures.language_items().declaration(right)?.clone();
-            Some(BTreeSet::from([left, right]))
+        let intrinsic = |present, absent| {
+            let items = self.signatures.language_items();
+            Some([items.declaration(present)?, items.declaration(absent)?])
         };
         let variants = match head {
             NominalHead::Intrinsic(IntrinsicNominal::Opt) => {

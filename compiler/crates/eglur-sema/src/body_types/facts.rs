@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use eglur_hir::{ExprId, Mutability};
 
 use super::LocalTypeFacts;
@@ -126,6 +128,22 @@ impl TypedOwnershipOperation {
     #[must_use]
     pub const fn source(self) -> LocalBindingId {
         self.source
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrierArm {
+    pub(super) may_select_present: bool,
+    pub(super) binding: Option<LocalBindingId>,
+}
+
+impl CarrierArm {
+    pub(crate) const fn may_select_present(self) -> bool {
+        self.may_select_present
+    }
+
+    pub(crate) const fn binding(self) -> Option<LocalBindingId> {
+        self.binding
     }
 }
 
@@ -432,6 +450,7 @@ pub struct BodyTypes {
     pub(super) regions: FactTable<ControlRegionKey, ControlRegion>,
     pub(super) checked_numeric: FactTable<ExpressionKey, CheckedNumericOperation>,
     pub(super) ownership_operations: FactTable<ExpressionKey, TypedOwnershipOperation>,
+    pub(super) carrier_arms: BTreeMap<ExpressionKey, Box<[CarrierArm]>>,
     pub(super) bodies: FactTable<DefId, BodyTypeSummary>,
     pub(super) transfers: Box<[ControlTransfer]>,
     pub(super) callable_instances: Box<[CallableInstance]>,
@@ -542,6 +561,13 @@ impl BodyTypes {
         self.ownership_operations.state(&key)
     }
 
+    pub(crate) fn carrier_arm(&self, region: &ControlRegionKey) -> Option<CarrierArm> {
+        let ControlRegionKey::MatchArm { owner, arm } = region else {
+            return None;
+        };
+        self.carrier_arms.get(owner)?.get(*arm).copied()
+    }
+
     pub fn ownership_operations(
         &self,
     ) -> impl ExactSizeIterator<Item = (ExpressionKey, TypedOwnershipOperation)> + '_ {
@@ -602,6 +628,11 @@ impl BodyTypes {
             + self.regions.iter().len()
             + self.checked_numeric.iter().len()
             + self.ownership_operations.iter().len()
+            + self
+                .carrier_arms
+                .values()
+                .map(|arms| arms.len())
+                .sum::<usize>()
             + self.bodies.iter().len()
             + self.transfers.len()
             + self.callable_instances.len()

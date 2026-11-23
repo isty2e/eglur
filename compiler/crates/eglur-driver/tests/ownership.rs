@@ -20,6 +20,9 @@ mod projection;
 #[path = "ownership/exit_regions.rs"]
 mod exit_regions;
 
+#[path = "ownership/carrier_guards.rs"]
+mod carrier_guards;
+
 #[path = "ownership/match_arms.rs"]
 mod match_arms;
 

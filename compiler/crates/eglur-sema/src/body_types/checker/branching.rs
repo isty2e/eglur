@@ -96,7 +96,7 @@ pub(super) struct MatchFrame {
     scrutinee_continuation: NormalContinuation,
     common: Option<TypeId>,
     any_normal_arm: bool,
-    coverage: Vec<(usize, PatternCoverage)>,
+    patterns: Vec<PatternCheck>,
     poison: PendingPoison,
     unperformed: bool,
     deferred: bool,
@@ -411,7 +411,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     ) -> Result<BranchPlan, BodyFlow> {
         let mut frame = Box::new(MatchFrame {
             owner,
-            coverage: Vec::with_capacity(expression.arms.len()),
+            patterns: Vec::with_capacity(expression.arms.len()),
             expression,
             request,
             next_arm: 0,
@@ -452,13 +452,22 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             && !frame.deferred
             && let Some(expected) = frame.scrutinee_type
         {
-            let coverage = frame
-                .coverage
-                .into_iter()
-                .map(|(index, coverage)| (&frame.expression.arms[index], coverage))
-                .collect::<Vec<_>>();
-            match self.check_match_coverage(source, expected, &coverage)? {
-                Outcome::Known(()) => {}
+            match self.check_match_coverage(
+                source,
+                expected,
+                &frame.expression.arms,
+                &frame.patterns,
+            )? {
+                Outcome::Known(arms) => {
+                    if let Some(existing) = self.carrier_arms.get(&frame.owner) {
+                        if Some(existing.as_ref()) != arms.as_deref() {
+                            return Err(DuplicateFact.into());
+                        }
+                    } else if let Some(arms) = arms {
+                        self.carrier_arms
+                            .insert(frame.owner, arms.into_boxed_slice());
+                    }
+                }
                 Outcome::Poisoned(found) => frame.poison.include(&found)?,
                 Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
                 Outcome::Deferred => frame.deferred = true,
@@ -504,7 +513,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         match pattern {
             Outcome::Known(pattern) => {
                 self.install_match_bindings(module, arm.pattern)?;
-                frame.coverage.push((frame.next_arm, pattern.coverage));
+                frame.patterns.push(pattern);
             }
             Outcome::Poisoned(found) => {
                 self.bind_pattern_poison(module, body, arm.pattern, found.clone())?;

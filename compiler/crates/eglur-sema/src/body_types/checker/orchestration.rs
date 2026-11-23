@@ -25,6 +25,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             regions: self.regions,
             checked_numeric: self.checked_numeric,
             ownership_operations: self.ownership_operations,
+            carrier_arms: self.carrier_arms,
             bodies: self.bodies,
             transfers: self.transfers.into_boxed_slice(),
             callable_instances: self.callable_instances.into_boxed_slice(),

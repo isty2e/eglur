@@ -3,7 +3,7 @@ use eglur_diagnostics::DiagnosticSnapshot;
 use eglur_driver::{SupportProfile, TrustedCatalog};
 use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct, SemanticLocation};
 
-fn checked(source: &str, expected: &[&str]) -> DiagnosticSnapshot {
+pub(super) fn checked(source: &str, expected: &[&str]) -> DiagnosticSnapshot {
     let mut session = session(source);
     let catalog = TrustedCatalog::first_slice().unwrap();
     let analysis = session
@@ -327,16 +327,16 @@ fn the_selected_arm_sees_its_own_guards_consumption() {
 }
 
 #[test]
-fn ordinary_match_is_checked_beside_guarded_owned_match_gap() {
+fn checked_sibling_is_retained_when_guard_fallthrough_changes_an_outer_root() {
     let source = concat!(
         "fn ordinary(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
         "  None => { drop_own move root\nyield 0 },\n",
         "  Some(value) => { drop_own move root\nyield value }\n",
         "}\n",
-        "fn guarded(input: Opt[Own[i64]]) -> i64 = match move input {\n",
-        "  Some(value) if false => { drop_own move value\nyield 0 },\n",
+        "fn guarded(input: Opt[Own[i64]], outer: Own[i64]) -> i64 = match move input {\n",
+        "  Some(value) if { drop_own move outer\nyield false } => { drop_own move value\nyield 0 },\n",
         "  Some(value) => { drop_own move value\nyield 1 },\n",
-        "  None => 2\n",
+        "  None => { drop_own move outer\nyield 2 }\n",
         "}\n",
     );
     let mut session = session(source);

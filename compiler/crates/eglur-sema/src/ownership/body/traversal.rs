@@ -54,17 +54,25 @@ struct MatchFrame<'hir> {
     branches: Alternatives,
     subject: ValueProvenance,
     result: ValueProvenance,
+    carrier: Option<OriginId>,
 }
 
 impl<'hir> MatchFrame<'hir> {
     fn schedule_value(
         self,
+        analyzer: &mut BodyAnalyzer<'_>,
+        state: &mut FlowState,
         region: ControlRegionKey,
         arm: &eglur_hir::MatchArm,
+        carrier_arm: Option<CarrierArm>,
         pending: &mut Vec<Step<'hir>>,
-    ) {
+    ) -> Result<(), OwnershipAnalysisError> {
+        if let Some(binding) = carrier_arm.and_then(CarrierArm::binding) {
+            analyzer.introduce_root(binding, state)?;
+        }
         pending.push(Step::MatchValue(self, region, arm.origin));
         pending.push(Step::Expression(arm.value, None));
+        Ok(())
     }
 }
 
@@ -84,6 +92,7 @@ enum Step<'hir> {
     Statement(StmtId),
     FinishExpression(ExpressionKey, OriginId),
     Reference(ExprId),
+    BorrowTentative(LocalBindingId, OriginId),
     Projection {
         expression: ExpressionKey,
         origin: OriginId,
@@ -101,6 +110,7 @@ enum Step<'hir> {
         MatchFrame<'hir>,
         ControlRegionKey,
         &'hir eglur_hir::MatchArm,
+        Option<CarrierArm>,
     ),
     MatchValue(MatchFrame<'hir>, ControlRegionKey, OriginId),
     BlockNext(BlockFrame<'hir>),
@@ -153,6 +163,13 @@ impl<'hir> BodyAnalyzer<'hir> {
                     let mut roots = flow.provenance.roots();
                     roots.extend(self.expression_roots(value, state)?);
                     flow.provenance = ValueProvenance::direct(roots);
+                }
+                Step::BorrowTentative(binding, origin) => {
+                    self.use_binding(binding, origin, state);
+                    flow = ExpressionFlow {
+                        continuing: true,
+                        provenance: ValueProvenance::direct(BTreeSet::from([binding])),
+                    };
                 }
                 Step::Projection {
                     expression: key,
@@ -224,12 +241,27 @@ impl<'hir> BodyAnalyzer<'hir> {
                         } else {
                             ValueProvenance::default()
                         };
+                        let carrier = self
+                            .signatures
+                            .types()
+                            .ownership_root(typed.ty())?
+                            .map(|_| self.expression_origin(value.scrutinee))
+                            .transpose()?;
+                        if carrier.is_some() {
+                            if typed.place().is_some()
+                                && self.named_root(value.scrutinee)?.is_none()
+                            {
+                                self.unperformed = true;
+                            }
+                            self.recover_missing_move(value.scrutinee, state)?;
+                        }
                         pending.push(Step::MatchNext(MatchFrame {
                             owner,
                             remaining: value.arms.iter().enumerate(),
                             branches: Alternatives::begin(state),
                             subject,
                             result: ValueProvenance::default(),
+                            carrier,
                         }));
                     }
                 }
@@ -240,11 +272,52 @@ impl<'hir> BodyAnalyzer<'hir> {
                             arm,
                         };
                         self.bind_pattern_provenance(value.pattern, &frame.subject, state)?;
+                        let carrier_arm = if let Some(scrutinee) = frame.carrier {
+                            let fact = self.body_types.carrier_arm(&region);
+                            match fact {
+                                Some(arm)
+                                    if arm.may_select_present() && arm.binding().is_none() =>
+                                {
+                                    let origin = self
+                                        .body
+                                        .pattern(value.pattern)
+                                        .ok_or(OwnershipAnalysisError::WrongBodyPattern(
+                                            value.pattern,
+                                        ))?
+                                        .origin();
+                                    self.failures.push(OwnershipFailure::at(
+                                        self.owner,
+                                        origin,
+                                        OwnershipCause::UnboundMatchPayload { scrutinee },
+                                    ));
+                                }
+                                None => self.unperformed = true,
+                                Some(_) => {}
+                            }
+                            fact
+                        } else {
+                            None
+                        };
                         if let Some(guard) = &value.guard {
-                            pending.push(Step::MatchGuard(frame, region, value));
+                            if let Some((scrutinee, arm)) = frame.carrier.zip(carrier_arm) {
+                                if arm.may_select_present() {
+                                    self.pending_payloads.push((region.clone(), scrutinee));
+                                }
+                                if let Some(binding) = arm.binding() {
+                                    self.tentative.insert(binding);
+                                }
+                            }
+                            pending.push(Step::MatchGuard(frame, region, value, carrier_arm));
                             pending.push(Step::Expression(guard.condition, None));
                         } else {
-                            frame.schedule_value(region, value, &mut pending);
+                            frame.schedule_value(
+                                self,
+                                state,
+                                region,
+                                value,
+                                carrier_arm,
+                                &mut pending,
+                            )?;
                         }
                     } else {
                         flow = ExpressionFlow {
@@ -253,7 +326,16 @@ impl<'hir> BodyAnalyzer<'hir> {
                         };
                     }
                 }
-                Step::MatchGuard(mut frame, region, arm) => {
+                Step::MatchGuard(mut frame, region, arm, carrier_arm) => {
+                    if let Some(arm) = carrier_arm {
+                        if arm.may_select_present() {
+                            let held = self.pending_payloads.pop().expect("active carrier guard");
+                            debug_assert_eq!(held.0, region);
+                        }
+                        if let Some(binding) = arm.binding() {
+                            self.tentative.remove(&binding);
+                        }
+                    }
                     // A pattern miss and a false guard can share the next arm's entry
                     // only if they agree on every binding that survives this arm.
                     if flow.continuing {
@@ -262,8 +344,16 @@ impl<'hir> BodyAnalyzer<'hir> {
                         }) {
                             self.unperformed = true;
                         }
-                        frame.schedule_value(region, arm, &mut pending);
+                        frame.schedule_value(
+                            self,
+                            state,
+                            region,
+                            arm,
+                            carrier_arm,
+                            &mut pending,
+                        )?;
                     } else {
+                        // A guard without a normal result leaves only pattern misses for later arms.
                         self.unperformed = true;
                         frame.branches.finish_arm(state, false);
                         pending.push(Step::MatchNext(frame));
@@ -428,9 +518,15 @@ impl<'hir> BodyAnalyzer<'hir> {
                 *flow = self.visit_ownership_operation(key, origin, state)?;
             }
             ExprKind::Name(_) => *flow = self.visit_name(id, origin, state)?,
-            ExprKind::Reference { value, .. } => {
-                pending.push(Step::Reference(*value));
-                pending.push(Step::Expression(*value, None));
+            ExprKind::Reference { value, mutability } => {
+                if *mutability == eglur_hir::Mutability::Immutable
+                    && let Some(binding) = self.tentative_place(*value)?
+                {
+                    pending.push(Step::BorrowTentative(binding, origin));
+                } else {
+                    pending.push(Step::Reference(*value));
+                    pending.push(Step::Expression(*value, None));
+                }
             }
             ExprKind::Group(inner) | ExprKind::Unsafe(inner) => {
                 pending.push(Step::Expression(*inner, None));
@@ -442,20 +538,23 @@ impl<'hir> BodyAnalyzer<'hir> {
                 ValueSequence::new([*left, *right], ValueSequenceKind::Discard),
             )),
             ExprKind::Call(call) => self.schedule_call(
+                key,
                 Some(call.callee),
                 call.arguments.iter().map(|argument| argument.value),
                 pending,
-            ),
+            )?,
             ExprKind::CatalogCall(call) => self.schedule_call(
+                key,
                 None,
                 call.arguments.iter().map(|argument| argument.value),
                 pending,
-            ),
+            )?,
             ExprKind::DTypeCall(call) => self.schedule_call(
+                key,
                 Some(call.callee),
                 call.arguments.iter().map(|argument| argument.value),
                 pending,
-            ),
+            )?,
             ExprKind::Member { receiver, .. } => {
                 if !matches!(
                     self.names.fact(ResolutionKey::Expression {
@@ -516,11 +615,10 @@ impl<'hir> BodyAnalyzer<'hir> {
                     .body_types
                     .expression(ExpressionKey::new(self.module, value.scrutinee));
                 if let FactState::Known(typed) = subject
-                    && self
-                        .signatures
-                        .types()
-                        .ownership_root(typed.ty())?
-                        .is_none()
+                    && !matches!(
+                        self.signatures.types().ownership_root(typed.ty())?,
+                        Some(crate::OwnershipRoot::Direct { .. })
+                    )
                 {
                     pending.push(Step::MatchSubject(key, value));
                     pending.push(Step::Expression(value.scrutinee, None));
@@ -582,6 +680,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                             .as_ref()
                             .expect("ordinary commitment retains an ordinary candidate");
                         self.schedule_call(
+                            key,
                             Some(ordinary.call.callee),
                             ordinary
                                 .call
@@ -589,7 +688,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                                 .iter()
                                 .map(|argument| argument.value),
                             pending,
-                        );
+                        )?;
                     }
                     FactState::Known(ReduceByCommitment::TensorSingle) => {
                         let single = candidate
@@ -712,10 +811,11 @@ impl<'hir> BodyAnalyzer<'hir> {
 
     fn schedule_call(
         &self,
+        key: ExpressionKey,
         callee: Option<ExprId>,
         arguments: impl IntoIterator<Item = ExprId>,
         pending: &mut Vec<Step<'hir>>,
-    ) {
+    ) -> Result<(), OwnershipAnalysisError> {
         let sequence = ValueSequence::new(
             arguments,
             ValueSequenceKind::Call {
@@ -724,10 +824,28 @@ impl<'hir> BodyAnalyzer<'hir> {
         );
         if let Some(callee) = callee {
             pending.push(Step::CallCallee(sequence, callee));
-            pending.push(Step::Expression(callee, None));
+            let step = if !self.tentative.is_empty()
+                && let Some(ExprKind::Member { receiver, .. }) =
+                    self.body.expression(callee).map(eglur_hir::Expr::kind)
+                && let FactState::Known(call) = self.body_types.invocation(key)
+                && call.arguments().first().is_some_and(|arg| {
+                    arg.expression() == *receiver
+                        && arg.passing()
+                            == crate::ArgumentPassing::BorrowPlace(
+                                crate::ReferenceMutability::Shared,
+                            )
+                })
+                && let Some(binding) = self.tentative_place(*receiver)?
+            {
+                Step::BorrowTentative(binding, self.expression_origin(*receiver)?)
+            } else {
+                Step::Expression(callee, None)
+            };
+            pending.push(step);
         } else {
             pending.push(Step::ValuesNext(sequence));
         }
+        Ok(())
     }
 
     fn schedule_if_branch(
