@@ -198,7 +198,7 @@ pub(crate) fn analyze_body(
             origin,
             false,
             &mut state,
-        )?;
+        );
     }
     let ownership_local_exists = body.patterns().try_fold(
         false,
@@ -649,27 +649,24 @@ impl BodyAnalyzer<'_> {
         }
     }
 
-    fn check_side_exits(
-        &mut self,
-        key: ExpressionKey,
-        origin: OriginId,
-        state: &FlowState,
-    ) -> Result<(), OwnershipAnalysisError> {
+    fn check_side_exits(&mut self, key: ExpressionKey, origin: OriginId, state: &FlowState) {
         let source = ControlTransferSource::Expression(key);
         let body_types = self.body_types;
         for transfer in body_types.transfers_from(&source) {
-            let mut exit_state = state.exit_snapshot();
-            self.check_transfer(transfer, origin, false, &mut exit_state)?;
+            let leaving = self.check_exit_obligations(transfer, origin, false, state);
             if let Some((_, exits)) = self
                 .recoverable_exits
                 .iter_mut()
                 .rev()
                 .find(|(region, _)| region == transfer.target())
             {
+                let mut exit_state = state.exit_snapshot();
+                for id in leaving {
+                    exit_state.end_binding(id);
+                }
                 exits.include(exit_state);
             }
         }
-        Ok(())
     }
 
     fn check_transfer_source(
@@ -678,21 +675,22 @@ impl BodyAnalyzer<'_> {
         origin: OriginId,
         closing_delimiter: bool,
         state: &mut FlowState,
-    ) -> Result<(), OwnershipAnalysisError> {
+    ) {
         let body_types = self.body_types;
         for transfer in body_types.transfers_from(source) {
-            self.check_transfer(transfer, origin, closing_delimiter, state)?;
+            for binding in self.check_exit_obligations(transfer, origin, closing_delimiter, state) {
+                state.end_binding(binding);
+            }
         }
-        Ok(())
     }
 
-    fn check_transfer(
+    fn check_exit_obligations(
         &mut self,
         transfer: &ControlTransfer,
         origin: OriginId,
         closing_delimiter: bool,
-        state: &mut FlowState,
-    ) -> Result<(), OwnershipAnalysisError> {
+        state: &FlowState,
+    ) -> BTreeSet<LocalBindingId> {
         // Region order must not replace binding order when several regions exit.
         let bindings = transfer
             .exited_regions()
@@ -721,10 +719,7 @@ impl BodyAnalyzer<'_> {
                 break;
             }
         }
-        for binding in bindings {
-            state.end_binding(binding);
-        }
-        Ok(())
+        bindings
     }
 
     fn expression_roots(

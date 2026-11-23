@@ -56,6 +56,18 @@ struct MatchFrame<'hir> {
     result: ValueProvenance,
 }
 
+impl<'hir> MatchFrame<'hir> {
+    fn schedule_value(
+        self,
+        region: ControlRegionKey,
+        arm: &eglur_hir::MatchArm,
+        pending: &mut Vec<Step<'hir>>,
+    ) {
+        pending.push(Step::MatchValue(self, region, arm.origin));
+        pending.push(Step::Expression(arm.value, None));
+    }
+}
+
 enum TransferKind {
     Return,
     Yield,
@@ -85,6 +97,11 @@ enum Step<'hir> {
     IfValue(IfFrame),
     MatchSubject(ExpressionKey, &'hir eglur_hir::MatchExpr),
     MatchNext(MatchFrame<'hir>),
+    MatchGuard(
+        MatchFrame<'hir>,
+        ControlRegionKey,
+        &'hir eglur_hir::MatchArm,
+    ),
     MatchValue(MatchFrame<'hir>, ControlRegionKey, OriginId),
     BlockNext(BlockFrame<'hir>),
     BlockValue(BlockFrame<'hir>),
@@ -129,7 +146,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                     self.schedule_statement(id, &mut flow, &mut pending)?;
                 }
                 Step::FinishExpression(key, origin) => {
-                    self.check_side_exits(key, origin, state)?;
+                    self.check_side_exits(key, origin, state);
                     flow.continuing = self.expression_continues(key, flow.continuing);
                 }
                 Step::Reference(value) => {
@@ -223,13 +240,33 @@ impl<'hir> BodyAnalyzer<'hir> {
                             arm,
                         };
                         self.bind_pattern_provenance(value.pattern, &frame.subject, state)?;
-                        pending.push(Step::MatchValue(frame, region, value.origin));
-                        pending.push(Step::Expression(value.value, None));
+                        if let Some(guard) = &value.guard {
+                            pending.push(Step::MatchGuard(frame, region, value));
+                            pending.push(Step::Expression(guard.condition, None));
+                        } else {
+                            frame.schedule_value(region, value, &mut pending);
+                        }
                     } else {
                         flow = ExpressionFlow {
                             continuing: frame.branches.finish(state),
                             provenance: frame.result,
                         };
+                    }
+                }
+                Step::MatchGuard(mut frame, region, arm) => {
+                    // A pattern miss and a false guard can share the next arm's entry
+                    // only if they agree on every binding that survives this arm.
+                    if flow.continuing {
+                        if frame.branches.changed_bindings(state).any(|id| {
+                            !matches!(self.body_types.local(id), FactState::Known(local) if local.region() == &region)
+                        }) {
+                            self.unperformed = true;
+                        }
+                        frame.schedule_value(region, arm, &mut pending);
+                    } else {
+                        self.unperformed = true;
+                        frame.branches.finish_arm(state, false);
+                        pending.push(Step::MatchNext(frame));
                     }
                 }
                 Step::MatchValue(mut frame, region, origin) => {
@@ -239,7 +276,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                             origin,
                             false,
                             state,
-                        )?;
+                        );
                         frame.result.extend(std::mem::take(&mut flow.provenance));
                     }
                     frame.branches.finish_arm(state, flow.continuing);
@@ -257,7 +294,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                             frame.origin,
                             true,
                             state,
-                        )?;
+                        );
                     }
                     flow.provenance = frame.provenance;
                 }
@@ -353,7 +390,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                         origin,
                         false,
                         state,
-                    )?;
+                    );
                     if !matches!(kind, TransferKind::Yield) || !flow.continuing {
                         flow.provenance = ValueProvenance::default();
                     }
@@ -484,7 +521,6 @@ impl<'hir> BodyAnalyzer<'hir> {
                         .types()
                         .ownership_root(typed.ty())?
                         .is_none()
-                    && value.arms.iter().all(|arm| arm.guard.is_none())
                 {
                     pending.push(Step::MatchSubject(key, value));
                     pending.push(Step::Expression(value.scrutinee, None));

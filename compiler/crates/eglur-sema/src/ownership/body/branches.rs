@@ -128,6 +128,18 @@ impl Alternatives {
         self.join.paths += 1;
     }
 
+    pub(super) fn changed_bindings<'a>(
+        &self,
+        state: &'a FlowState,
+    ) -> impl Iterator<Item = LocalBindingId> + 'a {
+        state
+            .before
+            .as_ref()
+            .expect("active branch")
+            .iter()
+            .filter_map(|(&id, entry)| (entry.as_ref() != state.bindings.get(&id)).then_some(id))
+    }
+
     pub(super) fn finish_arm(&mut self, state: &mut FlowState, continuing: bool) {
         let before = std::mem::take(state.before.as_mut().expect("active branch"));
         if continuing {

@@ -264,6 +264,69 @@ fn scrutinee_transfers_once_before_any_arm_forks() {
 }
 
 #[test]
+fn guard_fallthrough_preserves_outer_roots_and_discards_arm_locals() {
+    for guard in [
+        "inspect(&root)",
+        "{ let temp = own v\ndrop_own move temp\nyield flag }",
+    ] {
+        for (fallback, expected) in [
+            ("{ drop_own move root\nyield 2 }", &[][..]),
+            ("2", &["OWNERSHIP_PATH_UNBALANCED"][..]),
+        ] {
+            let source = format!(
+                "fn inspect(_x: &Own[i64]) -> Bool = false\n\
+                 fn check(input: Opt[i64], flag: Bool, root: Own[i64]) -> i64 = match input {{\n\
+                 Some(v) if {guard} => {{ drop_own move root\nyield 1 }},\n\
+                 Some(_) => {fallback}, None => {{ drop_own move root\nyield 3 }} }}\n\
+                 fn main!() -> Unit {{ let a: i64 = 1\nlet b: i64 = 2\nlet c: i64 = 3\n\
+                 _ = check(Some(1), true, own a)\n_ = check(Some(1), false, own b)\n\
+                 _ = check(None, false, own c)\n}}\n"
+            );
+            checked(&source, expected);
+        }
+    }
+}
+
+#[test]
+fn an_outer_move_in_a_guard_is_not_assumed_to_roll_back_on_false() {
+    let source = concat!(
+        "fn consume(x: Own[i64]) -> Bool { drop_own move x\nreturn false }\n",
+        "fn check(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
+        "  Some(_) if consume(move root) => 1,\n",
+        "  Some(_) => 2,\n",
+        "  None => { drop_own move root\nyield 3 }\n}\n",
+        "fn main!() -> Unit { let n: i64 = 1\n_ = check(Some(1), own n) }\n",
+    );
+    let mut session = session(source);
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    let analysis = session
+        .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+        .unwrap();
+    let missing = analysis
+        .trace()
+        .missing()
+        .map(|entry| entry.capability().stable_key())
+        .collect::<Vec<_>>();
+    assert_eq!(missing, ["typecheck.complete_ownership_flow"]);
+    let sealed = session.seal(None).unwrap();
+    assert!(sealed.checked_program().is_none());
+    assert!(diagnostic_codes(sealed.diagnostics()).is_empty());
+}
+
+#[test]
+fn the_selected_arm_sees_its_own_guards_consumption() {
+    checked(
+        concat!(
+            "fn check(input: Opt[i64], flag: Bool) -> i64 = match input {\n",
+            "  Some(v) if { let t = own v\ndrop_own move t\nyield flag } => v,\n",
+            "  Some(other) => other, None => 0 }\n",
+            "fn main!() -> Unit { _ = check(Some(1), true) }\n",
+        ),
+        &["OWNERSHIP_USE_AFTER_DISCHARGE"],
+    );
+}
+
+#[test]
 fn ordinary_match_is_checked_beside_guarded_owned_match_gap() {
     let source = concat!(
         "fn ordinary(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",

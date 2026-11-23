@@ -124,11 +124,13 @@ determine enum inhabitance. External variant construction and qualified external
 variant patterns remain unsupported.
 
 The ownership pass checks straight-line code, `if` branches, `result` and
-`checked` exits, and unguarded `match` on ordinary values. Different arms can
+`checked` exits, and `match` on ordinary values. Different arms can
 move the same outer root: each arm starts after the scrutinee, and only arms
-that continue contribute to the state after the match. A guarded match that
-needs ownership analysis, or a match that consumes an owned carrier, still
-reports `typecheck.complete_ownership_flow` at its callable. Such a body
+that continue contribute to the state after the match. A guard can borrow an
+outer root or consume an arm-local value. If the guard changes ownership or
+reference provenance outside its arm, the checker cannot yet follow the next
+arm. Such a match, or one that consumes an owned carrier, reports
+`typecheck.complete_ownership_flow` at its callable. An incomplete body
 prevents the program from sealing, but checked siblings keep their diagnostics.
 Loops and closures stop earlier, during body typing.
 
