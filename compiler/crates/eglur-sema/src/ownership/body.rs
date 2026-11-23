@@ -28,7 +28,8 @@ use eglur_diagnostics::{Poison, PoisonAccumulator};
 
 pub(super) struct OwnershipBodyAnalysis {
     pub(super) fact: SemanticFact<OwnershipBodySummary>,
-    pub(super) findings: OwnershipFindings,
+    // Coverage can poison the body fact even when this pass has independent findings.
+    pub(super) findings: Option<OwnershipFindings>,
 }
 
 #[derive(Clone, Copy)]
@@ -238,14 +239,10 @@ pub(super) fn analyze_body(
     if let Some(recovery) = recovery {
         return Ok(OwnershipBodyAnalysis {
             fact: SemanticFact::Poisoned(recovery.cause.clone()),
-            findings: if analyzer.unperformed {
-                OwnershipFindings::default()
-            } else {
-                OwnershipFindings {
-                    failures: analyzer.failures,
-                    superseded_coverage: analyzer.superseded_coverage,
-                }
-            },
+            findings: (!analyzer.unperformed).then_some(OwnershipFindings {
+                failures: analyzer.failures,
+                superseded_coverage: analyzer.superseded_coverage,
+            }),
         });
     }
     let ownership_local_exists = body.patterns().try_fold(
@@ -312,14 +309,10 @@ pub(super) fn analyze_body(
             roots,
             analyzer.operation_count,
         )),
-        findings: if unperformed {
-            OwnershipFindings::default()
-        } else {
-            OwnershipFindings {
-                failures: analyzer.failures,
-                superseded_coverage: analyzer.superseded_coverage,
-            }
-        },
+        findings: (!unperformed).then_some(OwnershipFindings {
+            failures: analyzer.failures,
+            superseded_coverage: analyzer.superseded_coverage,
+        }),
     })
 }
 

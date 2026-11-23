@@ -49,21 +49,14 @@ pub fn analyze_ownership(
         return Ok(recorder.finish(PhaseProduct::Unperformed));
     }
 
-    let (facts, failures) =
-        build_ownership_facts(collection, names, sources, signatures, body_types)?;
-
-    for module in collection.modules() {
-        for declaration in module.declarations() {
-            if let FactState::Known(summary) = facts.body(declaration.id())
-                && summary.status() == super::OwnershipBodyStatus::Unperformed
-            {
-                recorder.require(
-                    CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow),
-                    SemanticLocation::origin(module.file(), declaration.origin()),
-                );
-            }
-        }
-    }
+    let (facts, failures) = build_ownership_facts(
+        collection,
+        names,
+        sources,
+        signatures,
+        body_types,
+        &mut recorder,
+    )?;
 
     emit_ownership_diagnostics(&failures, collection, names, sources, diagnostics)?;
     Ok(recorder.finish(PhaseProduct::Performed(facts)))
@@ -76,6 +69,7 @@ fn build_ownership_facts(
     sources: &[SemanticSource<'_>],
     signatures: &DeclarationSignatures,
     body_types: &BodyTypes,
+    recorder: &mut DemandRecorder<'_>,
 ) -> Result<(OwnershipFacts, Vec<OwnershipFindings>), OwnershipAnalysisError> {
     let mut source_map = BTreeMap::new();
     for source in sources {
@@ -181,11 +175,16 @@ fn build_ownership_facts(
             body_types,
             recovery,
         )?;
-        if !analysis.findings.failures.is_empty() {
-            failures.push(analysis.findings);
-        }
-        if let SemanticFact::Known(summary) = &analysis.fact {
-            facts.complete &= summary.status() == super::OwnershipBodyStatus::Checked;
+        match analysis.findings {
+            Some(found) if !found.failures.is_empty() => failures.push(found),
+            Some(_) => {}
+            None => {
+                facts.complete = false;
+                recorder.require(
+                    CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow),
+                    SemanticLocation::origin(module.file(), declaration.origin()),
+                );
+            }
         }
         facts.bodies.insert(declaration.id(), analysis.fact)?;
     }

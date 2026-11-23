@@ -5,9 +5,9 @@ use eglur_driver::{
 };
 use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct, SemanticLocation};
 
-const ORDERED_GUARD: &str = concat!(
+const OUTCOME_DEPENDENT_GUARD: &str = concat!(
     "fn discharge(input: Opt[Own[i64]], side: Own[i64], flag: Bool) -> i64 = match move input {\n",
-    "  Some(v) if { drop_own move side\nyield flag } => { drop_own move v\nyield 1 },\n",
+    "  Some(v) if { yield if flag { drop_own move side\nyield false } else { yield true } } => { drop_own move side\ndrop_own move v\nyield 1 },\n",
     "  Some(v) => { drop_own move v\nyield 2 }, None => { drop_own move side\nyield 0 }\n",
     "}\n",
 );
@@ -28,7 +28,7 @@ fn core_attempt(source: &str, limit: Option<ToolLimit>) -> CompileAttempt {
 #[test]
 fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() {
     let main = format!(
-        "{ORDERED_GUARD}\
+        "{OUTCOME_DEPENDENT_GUARD}\
          fn balanced(root: Own[i64], flag: Bool) -> Unit {{\n\
            if flag {{ drop_own move root }} else {{ drop_own move root }}\n\
          }}\n\
@@ -46,7 +46,7 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
                     "  None => make(1), Some(value) => make(value)\n",
                     "}\n",
                     "fn release(input: Res[Own[i64], Str], side: Own[i64], flag: Bool) -> Unit = match move input {\n",
-                    "  Err(_) if { drop_own move side\nyield flag } => (), Err(_) => (),\n",
+                    "  Err(_) if { yield if flag { drop_own move side\nyield false } else { yield true } } => { drop_own move side }, Err(_) => (),\n",
                     "  Ok(value) => { drop_own move side\ndrop_own move value }\n",
                     "}\n",
                 )
@@ -110,7 +110,7 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
 
 #[test]
 fn ownership_gap_projects_as_unsupported_without_a_source_diagnostic() {
-    let source = format!("{ORDERED_GUARD}fn main!() -> Unit = ()\n");
+    let source = format!("{OUTCOME_DEPENDENT_GUARD}fn main!() -> Unit = ()\n");
     let attempt = core_attempt(&source, None);
     assert_eq!(attempt.disposition(), CompileDisposition::Unsupported);
     assert!(matches!(
@@ -143,6 +143,29 @@ fn ownership_gap_projects_as_unsupported_without_a_source_diagnostic() {
 }
 
 #[test]
+fn coverage_error_does_not_hide_incomplete_ownership_in_the_same_body() {
+    let source = OUTCOME_DEPENDENT_GUARD.replace(", None => { drop_own move side\nyield 0 }", "");
+    let source = format!(
+        "{source}fn main!() -> Unit {{ let n = 0\nlet s = 1\n_ = discharge(Some(own n), own s, false) }}\n"
+    );
+    let attempt = core_attempt(&source, None);
+    let CompileAttempt::Unsupported(unsupported) = attempt else {
+        panic!("lost ownership disposition: {:?}", attempt.disposition());
+    };
+    assert_eq!(
+        diagnostic_codes(unsupported.diagnostics()),
+        ["MATCH_NON_EXHAUSTIVE"]
+    );
+    assert!(
+        unsupported
+            .trace()
+            .trace()
+            .missing()
+            .any(|d| d.capability().stable_key() == "typecheck.complete_ownership_flow")
+    );
+}
+
+#[test]
 fn guard_without_a_normal_result_does_not_certify_later_arms() {
     let source = concat!(
         "fn test(_arg: i64) -> Bool = true\n",
@@ -166,7 +189,7 @@ fn guard_without_a_normal_result_does_not_certify_later_arms() {
 #[test]
 fn unsupported_ownership_preserves_independent_errors_and_tool_limit_precedence() {
     let source = format!(
-        "{ORDERED_GUARD}\
+        "{OUTCOME_DEPENDENT_GUARD}\
          fn bad(root: Own[i64]) -> i64 {{ return 0 }}\n\
          fn main!() -> Unit = ()\n"
     );
