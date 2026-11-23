@@ -26,6 +26,9 @@ mod carrier_guards;
 #[path = "ownership/ordered_guards.rs"]
 mod ordered_guards;
 
+#[path = "ownership/nested_guards.rs"]
+mod nested_guards;
+
 #[path = "ownership/coverage.rs"]
 mod coverage;
 
@@ -75,6 +78,33 @@ fn ownership_profile() -> SupportProfile {
 fn session(source: &str) -> CompilerSession {
     let request = FileSetRequest::single("main.eglur", source.as_bytes().to_vec()).unwrap();
     CompilerSession::build(request, SessionOptions::default()).unwrap()
+}
+
+fn checked_operation_count(source: &str, function: &str) -> usize {
+    let mut session = session(source);
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    let analysis = session
+        .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+        .unwrap();
+    assert!(analysis.trace().missing().next().is_none(), "{source}");
+    let resolution = analysis.resolution().unwrap();
+    let PhaseProduct::Performed(facts) = resolution.ownership_facts() else {
+        panic!("missing ownership analysis")
+    };
+    let declaration = resolution
+        .declarations()
+        .modules()
+        .flat_map(eglur_sema::ModuleDeclarations::declarations)
+        .find(|d| d.name().is_some_and(|n| n.spelling() == function))
+        .unwrap();
+    let eglur_sema::FactState::Known(body) = facts.body(declaration.id()) else {
+        panic!("missing ownership facts for {function}")
+    };
+    assert_eq!(body.status(), OwnershipBodyStatus::Checked);
+    let count = body.operation_count();
+    let snapshot = session.into_diagnostics(None);
+    assert!(snapshot.diagnostics().is_empty(), "{source}\n{snapshot:?}");
+    count
 }
 
 fn diagnostic_codes(snapshot: &DiagnosticSnapshot) -> Vec<&str> {

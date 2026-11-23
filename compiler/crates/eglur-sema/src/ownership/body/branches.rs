@@ -138,9 +138,8 @@ impl FlowState {
         self.remember(id);
         let value = self.bindings.entry(id).or_insert_with(|| {
             self.search
-                .as_ref()
-                .and_then(|routes| routes.entry_value(id))
-                .cloned()
+                .as_mut()
+                .map(|search| search.begin_write(id))
                 .unwrap_or_default()
         });
         change(value);
@@ -164,19 +163,10 @@ impl FlowState {
     }
 
     fn exit_snapshot(&self) -> Self {
-        let bindings = if let Some(routes) = &self.search {
-            let mut bindings = routes.materialize();
-            for (&id, value) in &self.bindings {
-                if value.is_default() {
-                    bindings.remove(&id);
-                } else {
-                    bindings.insert(id, value.clone());
-                }
-            }
-            bindings
-        } else {
-            self.bindings.clone()
-        };
+        let bindings = self.search.as_ref().map_or_else(
+            || self.bindings.clone(),
+            |search| search.materialize(&self.bindings),
+        );
         Self {
             bindings,
             ..Self::default()
@@ -282,7 +272,12 @@ impl Alternatives {
         for (id, original) in before {
             let outgoing = match original {
                 Some(value) => state.bindings.insert(id, value),
-                None => state.bindings.remove(&id),
+                None => {
+                    if let Some(search) = &mut state.search {
+                        search.discard_write(id);
+                    }
+                    state.bindings.remove(&id)
+                }
             };
             if continuing {
                 let fallback = state.search.as_ref().and_then(|s| s.entry_value(id));
@@ -315,7 +310,7 @@ pub(super) struct RecoverableExits {
 impl RecoverableExits {
     pub(super) fn begin(state: &FlowState) -> Self {
         Self {
-            owner: state.search.as_ref().map(|s| s.owner),
+            owner: state.search.as_ref().map(|s| s.owner()),
             join: PathJoin::begin(state),
         }
     }
@@ -329,7 +324,7 @@ impl RecoverableExits {
         for id in leaving {
             snapshot.bindings.remove(&id);
         }
-        let leaves_search = state.search.as_ref().map(|s| s.owner) != self.owner;
+        let leaves_search = state.search.as_ref().map(|s| s.owner()) != self.owner;
         self.join.paths += 1;
         for (id, mut value) in snapshot.bindings {
             if leaves_search {

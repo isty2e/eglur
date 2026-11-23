@@ -13,9 +13,17 @@ struct Work {
     samples: usize,
     roots: usize,
     snapshots: usize,
+    parked_reads: usize,
 }
 
-thread_local! { static WORK: Cell<Work> = const { Cell::new(Work { samples: 0, roots: 0, snapshots: 0 }) }; }
+thread_local! { static WORK: Cell<Work> = const { Cell::new(Work { samples: 0, roots: 0, snapshots: 0, parked_reads: 0 }) }; }
+
+pub(super) fn observe_parked_read() {
+    WORK.update(|mut w| {
+        w.parked_reads += 1;
+        w
+    });
+}
 
 pub(super) fn observe_sample(value: &BindingState) {
     WORK.update(|mut w| {
@@ -154,4 +162,108 @@ fn growing_false_prefix_does_not_revisit_every_binding_at_every_normal_exit() {
         assert_eq!(w.snapshots, 0);
         println!("width={width} {w:?}");
     }
+}
+
+#[test]
+fn deep_reads_go_directly_to_the_parked_writer_and_only_changes_travel_back() {
+    let owner = owner();
+    let binding =
+        |i| LocalBindingId::from_index(owner.module(), owner.expression().body(), i).unwrap();
+    let sources = |i| ValueProvenance::direct(BTreeSet::from([binding(i)]));
+    let one = Some(ConstructorSet([true, false]));
+
+    for depth in [1, 8, 32] {
+        for width in [2, 16, 64] {
+            for changed in [false, true] {
+                let mut state = FlowState::default();
+                for i in 0..width {
+                    state.set_alias(binding(i), sources(width));
+                }
+                let mut outer = MatchPaths::begin(&mut state, owner, true);
+                outer.enter(&mut state, one);
+                for i in 0..width / 2 {
+                    state.set_alias(binding(i), sources(width + 1));
+                }
+                assert!(outer.guard_false(&mut state, GuardScope::new(1), |_| Some(true)));
+                outer.select_body(&mut state);
+                for i in width / 2..width {
+                    state.set_alias(binding(i), sources(width + 1));
+                }
+
+                WORK.set(Work::default());
+                let mut searches = Vec::new();
+                for _ in 0..depth {
+                    let nested = MatchPaths::begin(&mut state, owner, true);
+                    nested.enter(&mut state, one);
+                    nested.select_body(&mut state);
+                    searches.push(nested);
+                }
+                for i in 0..width {
+                    assert_eq!(state.alias(binding(i)), Some(&sources(width + 1)));
+                }
+                assert!(WORK.get().parked_reads <= width);
+                if changed {
+                    for i in 0..width {
+                        state.set_alias(binding(i), sources(width + 2));
+                    }
+                }
+                for mut nested in searches.into_iter().rev() {
+                    nested.finish_arm(&mut state, true);
+                    assert!(nested.finish(&mut state));
+                }
+                let work = WORK.get();
+                assert!(work.samples <= if changed { width * depth } else { 0 });
+                assert_eq!(work.snapshots, 0);
+
+                outer.finish_arm(&mut state, true);
+                assert!(outer.finish(&mut state));
+                for i in 0..width {
+                    assert_eq!(
+                        state.alias(binding(i)),
+                        Some(&sources(width + 1 + usize::from(changed)))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_explicit_default_shadows_an_ancestor_and_rewinding_restores_it() {
+    let owner = owner();
+    let binding =
+        |i| LocalBindingId::from_index(owner.module(), owner.expression().body(), i).unwrap();
+    let p = binding(0);
+    let referent = ValueProvenance::direct(BTreeSet::from([binding(1)]));
+    let one = Some(ConstructorSet([true, false]));
+    let mut state = FlowState::default();
+    state.set_alias(p, referent.clone());
+
+    let mut outer = MatchPaths::begin(&mut state, owner, true);
+    outer.enter(&mut state, one);
+    outer.select_body(&mut state);
+    let mut branches = Alternatives::begin(&mut state);
+    let mut inner = MatchPaths::begin(&mut state, owner, true);
+    inner.enter(&mut state, one);
+    state.end_binding(p);
+    inner.finish_arm(&mut state, true);
+    assert!(inner.finish(&mut state));
+
+    let mut sibling = MatchPaths::begin(&mut state, owner, true);
+    sibling.enter(&mut state, one);
+    assert!(state.alias(p).is_none_or(ValueProvenance::is_empty));
+    assert!(state.exit_snapshot().alias(p).is_none());
+    sibling.finish_arm(&mut state, true);
+    assert!(sibling.finish(&mut state));
+    branches.finish_arm(&mut state, false);
+    branches.unchanged_path();
+    assert!(branches.finish(&mut state));
+
+    let mut sibling = MatchPaths::begin(&mut state, owner, true);
+    sibling.enter(&mut state, one);
+    assert_eq!(state.alias(p), Some(&referent));
+    sibling.finish_arm(&mut state, true);
+    assert!(sibling.finish(&mut state));
+    outer.finish_arm(&mut state, true);
+    assert!(outer.finish(&mut state));
 }

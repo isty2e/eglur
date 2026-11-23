@@ -133,16 +133,18 @@ impl<'hir> MatchFrame<'hir> {
         selection: ArmBody,
         pending: &mut Vec<Step<'hir>>,
     ) -> Result<(), OwnershipAnalysisError> {
-        pending.push(Step::MatchValue(self, region, arm.origin));
-        pending.push(match selection {
+        let value = match selection {
             ArmBody::Selected(carrier) => {
+                self.branches.select_body(state);
                 if let Some(binding) = carrier.and_then(CarrierArm::binding) {
                     analyzer.introduce_root(binding, state)?;
                 }
                 Step::Expression(arm.value, None)
             }
             ArmBody::WrittenOnly => Step::Written(Written::Expression(arm.value)),
-        });
+        };
+        pending.push(Step::MatchValue(self, region, arm.origin));
+        pending.push(value);
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use super::match_arms::checked;
 
-fn incomplete(source: &str) {
+pub(super) fn incomplete(source: &str) {
     let mut session = super::session(source);
     let catalog = eglur_driver::TrustedCatalog::first_slice().unwrap();
     let analysis = session
@@ -9,18 +9,14 @@ fn incomplete(source: &str) {
             Some(&catalog),
         )
         .unwrap();
-    assert_eq!(
-        analysis
-            .trace()
-            .missing()
-            .map(|missing| missing.capability().stable_key())
-            .collect::<Vec<_>>(),
-        ["typecheck.complete_ownership_flow"]
-    );
-    assert!(
-        session.into_diagnostics(None).diagnostics().is_empty(),
-        "{source}"
-    );
+    let missing: Vec<_> = analysis
+        .trace()
+        .missing()
+        .map(|item| item.capability().stable_key())
+        .collect();
+    let snapshot = session.into_diagnostics(None);
+    assert!(snapshot.diagnostics().is_empty(), "{source}\n{snapshot:?}");
+    assert_eq!(missing, ["typecheck.complete_ownership_flow"], "{source}");
 }
 
 #[test]
@@ -170,30 +166,7 @@ fn shared_guards_and_bodies_count_each_written_operation_once() {
         let source = format!(
             "fn f(input: Opt[i64], flag: Bool{parameters}) -> i64 = match input {{ {arms}_ => 1 }}\nfn main!() -> Unit {{ _ = f(None, false{args}) }}\n"
         );
-        let mut session = super::session(&source);
-        let catalog = eglur_driver::TrustedCatalog::first_slice().unwrap();
-        let analysis = session
-            .resolve(
-                &eglur_driver::SupportProfile::semantic_core_v1(),
-                Some(&catalog),
-            )
-            .unwrap();
-        assert!(analysis.trace().missing().next().is_none());
-        let resolution = analysis.resolution().unwrap();
-        let eglur_sema::PhaseProduct::Performed(facts) = resolution.ownership_facts() else {
-            panic!("missing ownership analysis")
-        };
-        let f = resolution
-            .declarations()
-            .modules()
-            .flat_map(eglur_sema::ModuleDeclarations::declarations)
-            .find(|d| d.name().is_some_and(|n| n.spelling() == "f"))
-            .unwrap();
-        let eglur_sema::FactState::Known(body) = facts.body(f.id()) else {
-            panic!("missing function body")
-        };
-        assert_eq!(body.operation_count(), 4 * width);
-        assert!(session.into_diagnostics(None).diagnostics().is_empty());
+        assert_eq!(super::checked_operation_count(&source, "f"), 4 * width);
     }
 }
 
