@@ -110,7 +110,7 @@ pub(super) fn with_checker_owned(
             regions: FactTable::new(),
             checked_numeric: FactTable::new(),
             ownership_operations: FactTable::new(),
-            carrier_arms: BTreeMap::new(),
+            match_arms: BTreeMap::new(),
             bodies: FactTable::new(),
             transfers: Vec::new(),
             callable_instances: Vec::new(),

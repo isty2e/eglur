@@ -579,12 +579,16 @@ impl<'support> DemandRecorder<'support> {
         }
     }
 
+    pub(crate) fn supports(&self, capability: CompileCapability) -> bool {
+        self.support.supports(capability)
+    }
+
     pub(crate) fn require(
         &mut self,
         capability: CompileCapability,
         location: SemanticLocation,
     ) -> bool {
-        let supported = self.support.supports(capability);
+        let supported = self.supports(capability);
         self.demands.push(CapabilityDemand {
             capability,
             location,

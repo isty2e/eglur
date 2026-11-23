@@ -4,6 +4,54 @@ use eglur_driver::{SupportProfile, TrustedCatalog};
 
 const IMBALANCE: &str = "OWNERSHIP_PATH_UNBALANCED";
 
+#[test]
+fn abrupt_guard_checks_written_uses_but_only_executed_exits() {
+    let source = |later: &str| {
+        format!(
+            "fn test(_arg: i64) -> Bool = true\n\
+         fn take(v: Opt[Own[i64]]) -> Bool {{ drop_own move v\nreturn true }}\n\
+         fn choose(r: Opt[Own[i64]]) -> i64 = match move r {{\n\
+         Some(x) => {{ drop_own move x\nyield 0 }},\n\
+         whole if test({{ return 7 }}) => 1, rest if {later} => 2, last => 3 }}\n"
+        )
+    };
+    checked(&source("true"), &[]);
+    fails_at(
+        &source("take(move rest)"),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN",
+        "move rest",
+    );
+    fails_at(
+        &source("take(rest)"),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN",
+        "rest",
+    );
+    fails_at(
+        &source("test({ return 8\nlet bad = take(move rest)\nyield 0 })"),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN",
+        "move rest",
+    );
+}
+
+#[test]
+fn stopped_first_argument_still_checks_later_guard_arguments() {
+    let source = |second: &str| {
+        format!(
+            "fn test(_n: i64, _flag: Bool) -> Bool = true\n\
+             fn take(v: Opt[Own[i64]]) -> Bool {{ drop_own move v\nreturn true }}\n\
+             fn choose(r: Opt[Own[i64]]) -> i64 = match move r {{\n\
+             Some(x) => {{ drop_own move x\nyield 0 }},\n\
+             whole if test({{ return 7 }}, {second}) => 1, rest => 2 }}\n"
+        )
+    };
+    checked(&source("true"), &[]);
+    fails_at(
+        &source("take(move whole)"),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN",
+        "move whole",
+    );
+}
+
 fn fails_at(source: &str, code: &str, site: &str) -> DiagnosticSnapshot {
     let snapshot = checked(source, &[code]);
     let primary = snapshot.diagnostics()[0]

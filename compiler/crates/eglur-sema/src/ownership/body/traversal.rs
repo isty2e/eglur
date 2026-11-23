@@ -32,13 +32,6 @@ impl ValueSequence {
             kind,
         }
     }
-
-    fn visits_after_termination(&self) -> bool {
-        matches!(
-            self.kind,
-            ValueSequenceKind::Discard | ValueSequenceKind::Constructor
-        )
-    }
 }
 
 struct IfFrame {
@@ -57,6 +50,21 @@ struct MatchFrame<'hir> {
     carrier: Option<OriginId>,
 }
 
+enum ArmBody {
+    Selected(Option<CarrierArm>),
+    WrittenOnly,
+}
+
+impl ArmBody {
+    fn on_entry(enters: bool, carrier: Option<CarrierArm>) -> Self {
+        if enters {
+            Self::Selected(carrier)
+        } else {
+            Self::WrittenOnly
+        }
+    }
+}
+
 impl<'hir> MatchFrame<'hir> {
     fn schedule_value(
         self,
@@ -64,14 +72,19 @@ impl<'hir> MatchFrame<'hir> {
         state: &mut FlowState,
         region: ControlRegionKey,
         arm: &eglur_hir::MatchArm,
-        carrier_arm: Option<CarrierArm>,
+        selection: ArmBody,
         pending: &mut Vec<Step<'hir>>,
     ) -> Result<(), OwnershipAnalysisError> {
-        if let Some(binding) = carrier_arm.and_then(CarrierArm::binding) {
-            analyzer.introduce_root(binding, state)?;
-        }
         pending.push(Step::MatchValue(self, region, arm.origin));
-        pending.push(Step::Expression(arm.value, None));
+        pending.push(match selection {
+            ArmBody::Selected(carrier) => {
+                if let Some(binding) = carrier.and_then(CarrierArm::binding) {
+                    analyzer.introduce_root(binding, state)?;
+                }
+                Step::Expression(arm.value, None)
+            }
+            ArmBody::WrittenOnly => Step::Written(Written::Expression(arm.value)),
+        });
         Ok(())
     }
 }
@@ -87,7 +100,15 @@ enum ProjectionReceiver {
     Value,
 }
 
+enum Written {
+    Expression(ExprId),
+    Transfer(ExprId),
+    Statement(StmtId),
+}
+
 enum Step<'hir> {
+    Written(Written),
+    ResumeAfterWritten(FlowState),
     Expression(ExprId, Option<ControlRegionKey>),
     Statement(StmtId),
     FinishExpression(ExpressionKey, OriginId),
@@ -149,6 +170,24 @@ impl<'hir> BodyAnalyzer<'hir> {
         let mut flow = ExpressionFlow::continuing();
         while let Some(step) = pending.pop() {
             match step {
+                Step::Written(node) => {
+                    if state.has_input() {
+                        let live = std::mem::replace(state, FlowState::written_only());
+                        pending.push(Step::ResumeAfterWritten(live));
+                    }
+                    match node {
+                        Written::Transfer(id) => {
+                            pending.push(Step::RecoverMove(id));
+                            pending.push(Step::Expression(id, None));
+                        }
+                        Written::Expression(id) => pending.push(Step::Expression(id, None)),
+                        Written::Statement(id) => pending.push(Step::Statement(id)),
+                    }
+                }
+                Step::ResumeAfterWritten(live) => {
+                    *state = live;
+                    flow = ExpressionFlow::default();
+                }
                 Step::Expression(id, region) => {
                     self.schedule_expression(id, region, state, &mut flow, &mut pending)?;
                 }
@@ -157,7 +196,8 @@ impl<'hir> BodyAnalyzer<'hir> {
                 }
                 Step::FinishExpression(key, origin) => {
                     self.check_side_exits(key, origin, state);
-                    flow.continuing = self.expression_continues(key, flow.continuing);
+                    flow.continuing =
+                        !state.has_input() || self.expression_continues(key, flow.continuing);
                 }
                 Step::Reference(value) => {
                     let mut roots = flow.provenance.roots();
@@ -215,6 +255,16 @@ impl<'hir> BodyAnalyzer<'hir> {
                             provenance: ValueProvenance::default(),
                         }));
                     } else {
+                        for id in [
+                            expression.unknown_branch,
+                            expression.else_branch,
+                            Some(expression.then_branch),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            pending.push(Step::Written(Written::Expression(id)));
+                        }
                         flow = ExpressionFlow::default();
                     }
                 }
@@ -231,39 +281,35 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::IfNext(frame));
                 }
                 Step::MatchSubject(owner, value) => {
-                    if flow.continuing {
-                        let key = ExpressionKey::new(self.module, value.scrutinee);
-                        let FactState::Known(typed) = self.body_types.expression(key) else {
-                            return Err(OwnershipAnalysisError::MissingExpressionType(key));
-                        };
-                        let subject = if self.signatures.types().contains_reference(typed.ty())? {
-                            std::mem::take(&mut flow.provenance)
-                        } else {
-                            ValueProvenance::default()
-                        };
-                        let carrier = self
-                            .signatures
-                            .types()
-                            .ownership_root(typed.ty())?
-                            .map(|_| self.expression_origin(value.scrutinee))
-                            .transpose()?;
-                        if carrier.is_some() {
-                            if typed.place().is_some()
-                                && self.named_root(value.scrutinee)?.is_none()
-                            {
-                                self.unperformed = true;
-                            }
-                            self.recover_missing_move(value.scrutinee, state)?;
+                    let key = ExpressionKey::new(self.module, value.scrutinee);
+                    let FactState::Known(typed) = self.body_types.expression(key) else {
+                        return Err(OwnershipAnalysisError::MissingExpressionType(key));
+                    };
+                    let subject = if self.signatures.types().contains_reference(typed.ty())? {
+                        std::mem::take(&mut flow.provenance)
+                    } else {
+                        ValueProvenance::default()
+                    };
+                    let carrier = self
+                        .signatures
+                        .types()
+                        .ownership_root(typed.ty())?
+                        .map(|_| self.expression_origin(value.scrutinee))
+                        .transpose()?;
+                    if carrier.is_some() {
+                        if typed.place().is_some() && self.named_root(value.scrutinee)?.is_none() {
+                            self.unperformed = true;
                         }
-                        pending.push(Step::MatchNext(MatchFrame {
-                            owner,
-                            remaining: value.arms.iter().enumerate(),
-                            branches: Alternatives::begin(state),
-                            subject,
-                            result: ValueProvenance::default(),
-                            carrier,
-                        }));
+                        self.recover_missing_move(value.scrutinee, state)?;
                     }
+                    pending.push(Step::MatchNext(MatchFrame {
+                        owner,
+                        remaining: value.arms.iter().enumerate(),
+                        branches: Alternatives::begin(state),
+                        subject,
+                        result: ValueProvenance::default(),
+                        carrier,
+                    }));
                 }
                 Step::MatchNext(mut frame) => {
                     if let Some((arm, value)) = frame.remaining.next() {
@@ -271,9 +317,16 @@ impl<'hir> BodyAnalyzer<'hir> {
                             owner: frame.owner,
                             arm,
                         };
-                        self.bind_pattern_provenance(value.pattern, &frame.subject, state)?;
+                        let control = self.body_types.match_arm(&region);
+                        let enters = control.is_some_and(|control| control.can_enter());
+                        if control.is_none() {
+                            self.unperformed = true;
+                        }
+                        if enters {
+                            self.bind_pattern_provenance(value.pattern, &frame.subject, state)?;
+                        }
                         let carrier_arm = if let Some(scrutinee) = frame.carrier {
-                            let fact = self.body_types.carrier_arm(&region);
+                            let fact = control.and_then(|control| control.carrier());
                             match fact {
                                 Some(arm)
                                     if arm.may_select_present() && arm.binding().is_none() =>
@@ -308,14 +361,18 @@ impl<'hir> BodyAnalyzer<'hir> {
                                 }
                             }
                             pending.push(Step::MatchGuard(frame, region, value, carrier_arm));
-                            pending.push(Step::Expression(guard.condition, None));
+                            pending.push(if enters {
+                                Step::Expression(guard.condition, None)
+                            } else {
+                                Step::Written(Written::Expression(guard.condition))
+                            });
                         } else {
                             frame.schedule_value(
                                 self,
                                 state,
                                 region,
                                 value,
-                                carrier_arm,
+                                ArmBody::on_entry(enters, carrier_arm),
                                 &mut pending,
                             )?;
                         }
@@ -326,7 +383,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                         };
                     }
                 }
-                Step::MatchGuard(mut frame, region, arm, carrier_arm) => {
+                Step::MatchGuard(frame, region, arm, carrier_arm) => {
                     if let Some(arm) = carrier_arm {
                         if arm.may_select_present() {
                             let held = self.pending_payloads.pop().expect("active carrier guard");
@@ -338,26 +395,19 @@ impl<'hir> BodyAnalyzer<'hir> {
                     }
                     // A pattern miss and a false guard can share the next arm's entry
                     // only if they agree on every binding that survives this arm.
-                    if flow.continuing {
-                        if frame.branches.changed_bindings(state).any(|id| {
-                            !matches!(self.body_types.local(id), FactState::Known(local) if local.region() == &region)
-                        }) {
-                            self.unperformed = true;
-                        }
-                        frame.schedule_value(
-                            self,
-                            state,
-                            region,
-                            arm,
-                            carrier_arm,
-                            &mut pending,
-                        )?;
-                    } else {
-                        // A guard without a normal result leaves only pattern misses for later arms.
+                    if flow.continuing && frame.branches.changed_bindings(state).any(|id| {
+                        !matches!(self.body_types.local(id), FactState::Known(local) if local.region() == &region)
+                    }) {
                         self.unperformed = true;
-                        frame.branches.finish_arm(state, false);
-                        pending.push(Step::MatchNext(frame));
                     }
+                    frame.schedule_value(
+                        self,
+                        state,
+                        region,
+                        arm,
+                        ArmBody::on_entry(flow.continuing, carrier_arm),
+                        &mut pending,
+                    )?;
                 }
                 Step::MatchValue(mut frame, region, origin) => {
                     if flow.continuing {
@@ -373,6 +423,13 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::MatchNext(frame));
                 }
                 Step::BlockNext(mut frame) => {
+                    if !flow.continuing
+                        && let Some(&statement) = frame.remaining.next()
+                    {
+                        pending.push(Step::BlockNext(frame));
+                        pending.push(Step::Written(Written::Statement(statement)));
+                        continue;
+                    }
                     if flow.continuing {
                         if let Some(&statement) = frame.remaining.next() {
                             pending.push(Step::BlockValue(frame));
@@ -395,11 +452,19 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::BlockNext(frame));
                 }
                 Step::ValuesNext(mut sequence) => {
-                    if (flow.continuing || sequence.visits_after_termination())
-                        && let Some(value) = sequence.remaining.next()
-                    {
-                        pending.push(Step::Value(sequence, value));
-                        pending.push(Step::Expression(value, None));
+                    if let Some(value) = sequence.remaining.next() {
+                        if flow.continuing {
+                            pending.push(Step::Value(sequence, value));
+                            pending.push(Step::Expression(value, None));
+                        } else {
+                            let transfer = !matches!(sequence.kind, ValueSequenceKind::Discard);
+                            pending.push(Step::ValuesNext(sequence));
+                            pending.push(Step::Written(if transfer {
+                                Written::Transfer(value)
+                            } else {
+                                Written::Expression(value)
+                            }));
+                        }
                         continue;
                     }
                     flow.provenance = match sequence.kind {
@@ -458,12 +523,18 @@ impl<'hir> BodyAnalyzer<'hir> {
                 }
                 Step::AssignmentTarget(target, value) => {
                     pending.push(Step::AssignmentValue(target, flow.continuing));
-                    pending.push(Step::Expression(value, None));
+                    pending.push(if flow.continuing {
+                        Step::Expression(value, None)
+                    } else {
+                        Step::Written(Written::Expression(value))
+                    });
                 }
                 Step::AssignmentValue(target, target_continues) => {
-                    if let Some(binding) = self.expression_local(target)?
-                        && self.binding_contains_reference(binding)?
+                    if state.has_input()
+                        && target_continues
                         && flow.continuing
+                        && let Some(binding) = self.expression_local(target)?
+                        && self.binding_contains_reference(binding)?
                     {
                         self.record_local_region(binding);
                         state.set_alias(binding, std::mem::take(&mut flow.provenance));
@@ -484,7 +555,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                     if !matches!(kind, TransferKind::Yield) || !flow.continuing {
                         flow.provenance = ValueProvenance::default();
                     }
-                    flow.continuing = false;
+                    flow.continuing = !state.has_input();
                 }
             }
         }

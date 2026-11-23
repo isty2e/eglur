@@ -380,6 +380,9 @@ impl BodyAnalyzer<'_> {
         in_flight: &[(OriginId, BTreeSet<LocalBindingId>)],
         state: &FlowState,
     ) {
+        if !state.has_input() {
+            return;
+        }
         for (origin, roots) in in_flight {
             for &root in roots {
                 let fact = state.availability(root);
@@ -436,7 +439,7 @@ impl BodyAnalyzer<'_> {
     ) -> Result<(), OwnershipAnalysisError> {
         use std::borrow::Cow;
 
-        if subject.is_empty() {
+        if !state.has_input() || subject.is_empty() {
             return Ok(());
         }
         let mut pending = vec![(pattern, Cow::Borrowed(subject))];
@@ -497,7 +500,7 @@ impl BodyAnalyzer<'_> {
         binding: LocalBindingId,
         state: &mut FlowState,
     ) -> Result<(), OwnershipAnalysisError> {
-        if !self.binding_is_root(binding)? {
+        if !state.has_input() || !self.binding_is_root(binding)? {
             return Ok(());
         }
         let FactState::Known(local) = self.body_types.local(binding) else {
@@ -512,6 +515,9 @@ impl BodyAnalyzer<'_> {
     }
 
     fn consume_root(&mut self, binding: LocalBindingId, origin: OriginId, state: &mut FlowState) {
+        if !state.has_input() {
+            return;
+        }
         self.record_local_region(binding);
         let mut fact = state.availability(binding);
         match fact.state {
@@ -535,6 +541,9 @@ impl BodyAnalyzer<'_> {
     }
 
     fn consume_source(&mut self, binding: LocalBindingId, origin: OriginId, state: &mut FlowState) {
+        if !state.has_input() {
+            return;
+        }
         self.record_local_region(binding);
         let mut fact = state.availability(binding);
         if fact.state == OwnershipAvailability::Owned {
@@ -555,6 +564,9 @@ impl BodyAnalyzer<'_> {
     }
 
     fn use_binding(&mut self, binding: LocalBindingId, origin: OriginId, state: &FlowState) {
+        if !state.has_input() {
+            return;
+        }
         let fact = state.availability(binding);
         if fact.state != OwnershipAvailability::Owned {
             self.failures.push(OwnershipFailure::new(
@@ -571,6 +583,9 @@ impl BodyAnalyzer<'_> {
     }
 
     fn use_roots(&mut self, roots: &BTreeSet<LocalBindingId>, origin: OriginId, state: &FlowState) {
+        if !state.has_input() {
+            return;
+        }
         for &root in roots {
             let fact = state.availability(root);
             if fact.state != OwnershipAvailability::Owned {
@@ -642,6 +657,9 @@ impl BodyAnalyzer<'_> {
         origin: OriginId,
         state: &mut FlowState,
     ) {
+        if !state.has_input() {
+            return;
+        }
         self.record_local_region(binding);
         let mut fact = state.availability(binding);
         if fact.state == OwnershipAvailability::Owned {
@@ -689,6 +707,9 @@ impl BodyAnalyzer<'_> {
     }
 
     fn check_side_exits(&mut self, key: ExpressionKey, origin: OriginId, state: &FlowState) {
+        if !state.has_input() {
+            return;
+        }
         let source = ControlTransferSource::Expression(key);
         let body_types = self.body_types;
         for transfer in body_types.transfers_from(&source) {
@@ -715,6 +736,9 @@ impl BodyAnalyzer<'_> {
         closing_delimiter: bool,
         state: &mut FlowState,
     ) {
+        if !state.has_input() {
+            return;
+        }
         let body_types = self.body_types;
         for transfer in body_types.transfers_from(source) {
             for binding in self.check_exit_obligations(transfer, origin, closing_delimiter, state) {

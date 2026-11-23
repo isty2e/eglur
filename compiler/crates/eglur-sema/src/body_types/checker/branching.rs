@@ -1,5 +1,9 @@
 use super::*;
 
+mod search;
+use search::ArmSearch;
+pub(super) use search::MatchDomain;
+
 #[cfg(test)]
 mod poison_tests;
 
@@ -9,6 +13,7 @@ pub(super) enum BranchPlan {
         expression: ExprId,
         request: TypeRequest,
         continuation: BranchContinuation,
+        path: NormalContinuation,
     },
     IfBranch {
         region: ControlRegionKey,
@@ -97,6 +102,8 @@ pub(super) struct MatchFrame {
     common: Option<TypeId>,
     any_normal_arm: bool,
     patterns: Vec<PatternCheck>,
+    search: Option<ArmSearch>,
+    entries: Vec<NormalContinuation>,
     poison: PendingPoison,
     unperformed: bool,
     deferred: bool,
@@ -139,6 +146,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             return BranchPlan::Complete(Outcome::Unperformed);
         }
         BranchPlan::Expression {
+            path: NormalContinuation::Present,
             expression: expression.condition,
             request: TypeRequest::definitive(None),
             continuation: BranchContinuation::IfCondition {
@@ -170,6 +178,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             return BranchPlan::Complete(Outcome::Unperformed);
         }
         BranchPlan::Expression {
+            path: NormalContinuation::Present,
             expression: expression.scrutinee,
             request: TypeRequest::definitive(None),
             continuation: if expression.arms.is_empty() {
@@ -412,6 +421,8 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         let mut frame = Box::new(MatchFrame {
             owner,
             patterns: Vec::with_capacity(expression.arms.len()),
+            entries: Vec::with_capacity(expression.arms.len()),
+            search: None,
             expression,
             request,
             next_arm: 0,
@@ -427,6 +438,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Outcome::Known(value) => {
                 frame.scrutinee_type = Some(value.ty);
                 frame.scrutinee_continuation = value.normal_continuation;
+                frame.search = self.match_domain(value.ty)?.map(ArmSearch::new);
             }
             Outcome::Poisoned(found) => frame.poison.include(&found)?,
             Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
@@ -447,25 +459,46 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 frame,
             });
         }
-        if !frame.poison.has_poison()
-            && !frame.unperformed
-            && !frame.deferred
-            && let Some(expected) = frame.scrutinee_type
-        {
+        if !frame.poison.has_poison() && !frame.unperformed && !frame.deferred {
+            // Coverage is a prerequisite only after the written arms have checked.
+            if frame
+                .search
+                .as_ref()
+                .is_none_or(|search| search.domain.carrier)
+            {
+                let origin = self.pattern_origin(source, frame.expression.arms[0].pattern)?;
+                if !self.recorder.require(
+                    CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
+                    SemanticLocation::origin(source.file(), origin),
+                ) {
+                    return Ok(BranchPlan::Complete(Outcome::Unperformed));
+                }
+            }
+            let Some(search) = &frame.search else {
+                return Ok(BranchPlan::Complete(Outcome::Unperformed));
+            };
             match self.check_match_coverage(
                 source,
-                expected,
+                &search.domain,
                 &frame.expression.arms,
                 &frame.patterns,
             )? {
                 Outcome::Known(arms) => {
-                    if let Some(existing) = self.carrier_arms.get(&frame.owner) {
-                        if Some(existing.as_ref()) != arms.as_deref() {
+                    let facts = frame
+                        .entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, entry)| MatchArmControl {
+                            entry,
+                            carrier: arms.as_ref().map(|facts| facts[i]),
+                        })
+                        .collect::<Box<[_]>>();
+                    if let Some(existing) = self.match_arms.get(&frame.owner) {
+                        if *existing != facts {
                             return Err(DuplicateFact.into());
                         }
-                    } else if let Some(arms) = arms {
-                        self.carrier_arms
-                            .insert(frame.owner, arms.into_boxed_slice());
+                    } else {
+                        self.match_arms.insert(frame.owner, facts);
                     }
                 }
                 Outcome::Poisoned(found) => frame.poison.include(&found)?,
@@ -510,9 +543,29 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         } else {
             Outcome::Unperformed
         };
+        // Missing input cannot prove an arm dead; independent arm type errors still count.
+        let mut entry = if frame.scrutinee_type.is_some() {
+            frame.scrutinee_continuation
+        } else {
+            NormalContinuation::Present
+        };
         match pattern {
             Outcome::Known(pattern) => {
                 self.install_match_bindings(module, arm.pattern)?;
+                if let Some(search) = &mut frame.search {
+                    entry = entry.strict(search.enter(&pattern));
+                    if entry.is_present() && search.uncertain_entry() {
+                        self.demand_unimplemented(
+                            TypecheckCapability::AnalyzePatternCoverage,
+                            context.source,
+                            self.pattern_origin(context.source, arm.pattern)?,
+                        );
+                        frame.unperformed = true;
+                    }
+                    if arm.guard.is_none() {
+                        search.keep_misses();
+                    }
+                }
                 frame.patterns.push(pattern);
             }
             Outcome::Poisoned(found) => {
@@ -522,15 +575,17 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
             Outcome::Deferred => frame.deferred = true,
         }
+        frame.entries.push(entry);
         if let Some(guard) = &arm.guard {
             let bool_ty = self.primitive(PrimitiveType::Bool)?;
             return Ok(BranchPlan::Expression {
                 expression: guard.condition,
                 request: TypeRequest::local(Some(bool_ty)),
                 continuation: BranchContinuation::MatchGuard { frame, bool_ty },
+                path: entry,
             });
         }
-        Ok(frame.body_plan(NormalContinuation::Present))
+        Ok(frame.body_plan(entry))
     }
 
     fn resume_match_guard(
@@ -566,7 +621,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     )?;
                     frame.poison.include(&found)?;
                 }
-                value.normal_continuation
+                if value.ty == bool_ty
+                    && !value.normal_continuation.is_present()
+                    && let Some(search) = &mut frame.search
+                {
+                    search.stop_matched();
+                }
+                frame.entries[frame.next_arm].strict(value.normal_continuation)
             }
             Outcome::Poisoned(found) => {
                 frame.poison.include(&found)?;
@@ -603,7 +664,12 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     ) -> Result<BranchPlan, BodyFlow> {
         match outcome {
             Outcome::Known(value)
-                if !guard_continuation.is_present() || !value.normal_continuation.is_present() => {}
+                if !guard_continuation.is_present()
+                    || !value.normal_continuation.is_present()
+                    || frame
+                        .search
+                        .as_ref()
+                        .is_some_and(ArmSearch::uncertain_entry) => {}
             Outcome::Known(value) => {
                 frame.any_normal_arm = true;
                 if let Some(left) = frame.common {

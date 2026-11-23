@@ -154,20 +154,13 @@ fn guard_without_a_normal_result_does_not_certify_later_arms() {
         "  rest => { drop_own move rest\nyield 3 } }\n",
         "fn main!() -> Unit = ()\n",
     );
-    match core_attempt(source, None) {
-        CompileAttempt::Unsupported(attempt) => {
-            assert!(attempt.trace().trace().missing().any(
-                |entry| entry.capability().stable_key() == "typecheck.complete_ownership_flow"
-            ));
-        }
-        CompileAttempt::Rejected(attempt) => {
-            assert_eq!(
-                attempt.errors().first_error().code().as_str(),
-                "OWNERSHIP_GUARD_CONSUME_FORBIDDEN"
-            );
-        }
-        other => panic!("uncertified guard: {:?}", other.disposition()),
-    }
+    let CompileAttempt::Rejected(attempt) = core_attempt(source, None) else {
+        panic!("a written move of a tentative binding must be rejected");
+    };
+    assert_eq!(
+        attempt.errors().first_error().code().as_str(),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN"
+    );
 }
 
 #[test]

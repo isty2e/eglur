@@ -26,9 +26,21 @@ type BeforeImages = BTreeMap<LocalBindingId, Option<BindingState>>;
 pub(super) struct FlowState {
     bindings: Bindings,
     before: Option<BeforeImages>,
+    written_only: bool,
 }
 
 impl FlowState {
+    pub(super) fn written_only() -> Self {
+        Self {
+            written_only: true,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn has_input(&self) -> bool {
+        !self.written_only
+    }
+
     pub(super) fn availability(&self, id: LocalBindingId) -> AvailabilityFact {
         self.bindings
             .get(&id)
@@ -48,6 +60,9 @@ impl FlowState {
     }
 
     fn update(&mut self, id: LocalBindingId, change: impl FnOnce(&mut BindingState)) {
+        if self.written_only {
+            return;
+        }
         self.remember(id);
         let value = self.bindings.entry(id).or_default();
         change(value);
@@ -75,6 +90,7 @@ impl FlowState {
         Self {
             bindings: self.bindings.clone(),
             before: None,
+            written_only: false,
         }
     }
 }

@@ -678,14 +678,10 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         )
     }
 
-    pub(in super::super) fn check_match_coverage(
+    pub(in super::super) fn match_domain(
         &mut self,
-        source: &SemanticSource<'_>,
         scrutinee: TypeId,
-        arms: &[eglur_hir::MatchArm],
-        patterns: &[PatternCheck],
-    ) -> Result<Outcome<Option<Vec<CarrierArm>>>, BodyFlow> {
-        assert_eq!(arms.len(), patterns.len(), "all arms passed pattern typing");
+    ) -> Result<Option<branching::MatchDomain>, BodyFlow> {
         let payloads = match self.signatures.types().ownership_root(scrutinee)? {
             Some(crate::OwnershipRoot::Optional { payload }) => Some([Some(payload), None]),
             Some(crate::OwnershipRoot::Result { payload, error }) => {
@@ -695,17 +691,10 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         };
         let mut impossible = [false; 2];
         if let Some(payloads) = payloads {
-            let origin = self.pattern_origin(
-                source,
-                arms.first()
-                    .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?
-                    .pattern,
-            )?;
-            if !self.recorder.require(
-                CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
-                SemanticLocation::origin(source.file(), origin),
-            ) {
-                return Ok(Outcome::Unperformed);
+            if !self.recorder.supports(CompileCapability::Typecheck(
+                TypecheckCapability::AnalyzeInhabitance,
+            )) {
+                return Ok(None);
             }
             for (impossible, payload) in impossible.iter_mut().zip(payloads) {
                 if let Some(ty) = payload {
@@ -715,9 +704,27 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             }
         }
 
-        let universe = self.match_variant_universe(scrutinee)?;
+        Ok(Some(branching::MatchDomain {
+            constructors: self
+                .match_variant_universe(scrutinee)?
+                .map(|roles| roles.map(Clone::clone)),
+            impossible,
+            carrier: payloads.is_some(),
+        }))
+    }
+
+    pub(in super::super) fn check_match_coverage(
+        &mut self,
+        source: &SemanticSource<'_>,
+        domain: &branching::MatchDomain,
+        arms: &[eglur_hir::MatchArm],
+        patterns: &[PatternCheck],
+    ) -> Result<Outcome<Option<Vec<CarrierArm>>>, BodyFlow> {
+        assert_eq!(arms.len(), patterns.len(), "all arms passed pattern typing");
+        let impossible = domain.impossible;
+        let universe = domain.constructors.as_ref().map(|roles| roles.each_ref());
         let mut carrier_arms =
-            (payloads.is_some() && universe.is_some()).then(|| Vec::with_capacity(arms.len()));
+            (domain.carrier && universe.is_some()).then(|| Vec::with_capacity(arms.len()));
         let mut total = universe.is_some() && impossible == [true, true];
         let mut variants = BTreeSet::new();
         if let Some(roles) = universe {
@@ -822,7 +829,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         Ok(variants)
     }
 
-    fn pattern_origin(
+    pub(in super::super) fn pattern_origin(
         &self,
         source: &SemanticSource<'_>,
         pattern: PatternId,

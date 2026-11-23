@@ -132,6 +132,22 @@ impl TypedOwnershipOperation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MatchArmControl {
+    pub(super) entry: NormalContinuation,
+    pub(super) carrier: Option<CarrierArm>,
+}
+
+impl MatchArmControl {
+    pub(crate) fn can_enter(self) -> bool {
+        self.entry.is_present()
+    }
+
+    pub(crate) fn carrier(self) -> Option<CarrierArm> {
+        self.carrier
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CarrierArm {
     pub(super) may_select_present: bool,
     pub(super) binding: Option<LocalBindingId>,
@@ -450,7 +466,7 @@ pub struct BodyTypes {
     pub(super) regions: FactTable<ControlRegionKey, ControlRegion>,
     pub(super) checked_numeric: FactTable<ExpressionKey, CheckedNumericOperation>,
     pub(super) ownership_operations: FactTable<ExpressionKey, TypedOwnershipOperation>,
-    pub(super) carrier_arms: BTreeMap<ExpressionKey, Box<[CarrierArm]>>,
+    pub(super) match_arms: BTreeMap<ExpressionKey, Box<[MatchArmControl]>>,
     pub(super) bodies: FactTable<DefId, BodyTypeSummary>,
     pub(super) transfers: Box<[ControlTransfer]>,
     pub(super) callable_instances: Box<[CallableInstance]>,
@@ -561,11 +577,11 @@ impl BodyTypes {
         self.ownership_operations.state(&key)
     }
 
-    pub(crate) fn carrier_arm(&self, region: &ControlRegionKey) -> Option<CarrierArm> {
+    pub(crate) fn match_arm(&self, region: &ControlRegionKey) -> Option<MatchArmControl> {
         let ControlRegionKey::MatchArm { owner, arm } = region else {
             return None;
         };
-        self.carrier_arms.get(owner)?.get(*arm).copied()
+        self.match_arms.get(owner)?.get(*arm).copied()
     }
 
     pub fn ownership_operations(
@@ -629,7 +645,7 @@ impl BodyTypes {
             + self.checked_numeric.iter().len()
             + self.ownership_operations.iter().len()
             + self
-                .carrier_arms
+                .match_arms
                 .values()
                 .map(|arms| arms.len())
                 .sum::<usize>()
