@@ -14,9 +14,17 @@ struct Work {
     roots: usize,
     snapshots: usize,
     parked_reads: usize,
+    shared_entries: usize,
 }
 
-thread_local! { static WORK: Cell<Work> = const { Cell::new(Work { samples: 0, roots: 0, snapshots: 0, parked_reads: 0 }) }; }
+thread_local! { static WORK: Cell<Work> = const { Cell::new(Work { samples: 0, roots: 0, snapshots: 0, parked_reads: 0, shared_entries: 0 }) }; }
+
+pub(super) fn observe_shared_entry() {
+    WORK.update(|mut w| {
+        w.shared_entries += 1;
+        w
+    });
+}
 
 pub(super) fn observe_parked_read() {
     WORK.update(|mut w| {
@@ -161,6 +169,67 @@ fn growing_false_prefix_does_not_revisit_every_binding_at_every_normal_exit() {
         );
         assert_eq!(w.snapshots, 0);
         println!("width={width} {w:?}");
+    }
+}
+
+#[test]
+fn shared_bodies_only_project_the_bindings_they_use() {
+    let owner = owner();
+    let id = |i| LocalBindingId::from_index(owner.module(), owner.expression().body(), i).unwrap();
+    let first = Some(ConstructorSet([true, false]));
+    let both = Some(ConstructorSet([true, true]));
+    for width in [8, 128, 512] {
+        for arms in [4, 32] {
+            let (a, b, c, local) = (id(width), id(width + 1), id(width + 2), id(width + 3));
+            let source = |r| ValueProvenance::direct(BTreeSet::from([r]));
+            let merged = |r| ValueProvenance::direct(BTreeSet::from([a, r]));
+            let mut state = FlowState::default();
+            for i in 0..width {
+                state.set_alias(id(i), source(a));
+            }
+            let mut outer = MatchPaths::begin(&mut state, owner, true);
+            outer.enter(&mut state, first);
+            for i in 0..width {
+                state.set_alias(id(i), source(b));
+            }
+            assert!(outer.guard_false(&mut state, GuardScope::new(1), |_| Some(true)));
+            outer.finish_arm(&mut state, false);
+
+            WORK.set(Work::default());
+            for i in 0..arms {
+                let p = id(i % width);
+                outer.enter(&mut state, both);
+                let routed = state.alias(p).unwrap().clone();
+                assert_eq!(routed.for_constructor(0), source(b));
+                assert_eq!(routed.for_constructor(1), source(a));
+                state.set_alias(local, routed);
+                assert!(outer.guard_false(&mut state, GuardScope::new(2), |id| Some(id != local)));
+                outer.select_body(&mut state);
+                assert_eq!(state.alias(local), Some(&merged(b)));
+
+                let mut child = MatchPaths::begin(&mut state, owner, true);
+                child.enter(&mut state, first);
+                assert_eq!(state.alias(p), Some(&merged(b)));
+                assert_eq!(state.alias(local), Some(&merged(b)));
+                child.finish_arm(&mut state, true);
+                assert!(child.finish(&mut state));
+                outer.finish_arm(&mut state, false);
+            }
+            let work = WORK.get();
+            assert!(work.shared_entries <= 2 * arms, "{width}/{arms}: {work:?}");
+            assert_eq!(work.snapshots, 0);
+
+            outer.enter(&mut state, first);
+            state.set_alias(id(0), source(c));
+            assert!(outer.guard_false(&mut state, GuardScope::new(3), |_| Some(true)));
+            outer.finish_arm(&mut state, false);
+            outer.enter(&mut state, both);
+            assert_eq!(state.alias(id(0)).unwrap().for_constructor(0), source(c));
+            outer.select_body(&mut state);
+            assert_eq!(state.alias(id(0)), Some(&merged(c)));
+            outer.finish_arm(&mut state, true);
+            assert!(outer.finish(&mut state));
+        }
     }
 }
 

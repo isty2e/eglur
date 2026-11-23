@@ -101,6 +101,25 @@ fn a_nested_match_in_a_partial_guard_cannot_erase_a_choice_of_referent() {
 }
 
 #[test]
+fn a_shared_body_inside_a_live_guard_preserves_its_choice_of_referent() {
+    incomplete(
+        "fn peek(_v: &i64) -> i64 = 0
+fn f(outer: Opt[i64], inner: Opt[i64], a: i64, b: i64, take: Bool, flag: Bool) -> i64 {
+let mut q = if flag { yield &a } else { yield &b }
+return match outer { Some(0) if { let mut p = &a
+let step = match inner { Some(_) if { p = &b
+yield take } => { return 7 }, _ => { q = p
+yield 1 } }
+yield flag } => { let r = own b
+let n = peek(q)
+drop_own move r
+yield n }, _ => 0 } }
+fn main!() -> Unit { _ = f(Some(0), Some(1), 1, 2, false, true)
+_ = f(Some(0), None, 1, 2, false, true) }",
+    );
+}
+
+#[test]
 fn a_false_nested_guard_preserves_a_copied_enclosing_choice() {
     let source = alias_guard(
         "let q = if flag { yield &a } else { yield &b }\nlet n = match input { _ if { p = q\nyield flag } => { return 3 }, _ => 0 }\nyield flag",
@@ -172,20 +191,25 @@ fn shared_guards_and_bodies_count_each_written_operation_once() {
 
 #[test]
 fn a_shared_guard_copies_each_constructors_tuple_referents() {
-    let make = |slot: usize| {
+    let make = |slot: usize, body: &str| {
         format!(
             "fn peek(_v: &i64) -> i64 = 0\n\
-         fn f(input: Opt[i64], a: i64, b: i64, flag: Bool) -> i64 {{\n\
+         fn f(input: Opt[i64], inner: Opt[i64], a: i64, b: i64, flag: Bool) -> i64 {{\n\
          let mut p = (&a, &b)\nlet mut q = (&b, &a)\nreturn match input {{\n\
          Some(_) if {{ p = (&b, &a)\nq = (&a, &b)\nyield flag }} => 0,\n\
-         _ if {{ p = q\nyield flag }} => 1,\n\
+         _ if {{ p = q\nyield flag }} => {body},\n\
          None => {{ let r = own a\nlet n = peek(p.{slot})\ndrop_own move r\nyield n }},\n\
          Some(_) => {{ let r = own b\nlet n = peek(p.{slot})\ndrop_own move r\nyield n }} }}\n}}\n\
-         fn main!() -> Unit {{ _ = f(Some(0), 1, 2, false)\n_ = f(None, 1, 2, false) }}\n"
+         fn main!() -> Unit {{ _ = f(Some(0), None, 1, 2, false)\n_ = f(None, Some(0), 1, 2, false) }}\n"
         )
     };
-    checked(&make(0), &[]);
-    checked(&make(1), &["OWNERSHIP_USE_AFTER_DISCHARGE"]);
+    for body in [
+        "1",
+        "match inner { Some(_) if { p = (&b, &b)\nyield flag } => 1, Some(_) => 2, None => 3 }",
+    ] {
+        checked(&make(0, body), &[]);
+        checked(&make(1, body), &["OWNERSHIP_USE_AFTER_DISCHARGE"]);
+    }
 }
 
 #[test]

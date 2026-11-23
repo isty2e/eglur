@@ -1,5 +1,6 @@
 use super::*;
 use crate::body_types::ConstructorSet;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
@@ -54,14 +55,23 @@ impl MatchPaths {
         if let Self::Ordered = self {
             let routes = state.search.as_mut().expect("ordered search");
             routes.current.position =
-                ArmPosition::Matching(constructors.expect("whole constructor entries"));
+                ArmPosition::Routing(constructors.expect("whole constructor entries"));
         }
     }
 
     pub(in super::super) fn select_body(&self, state: &mut FlowState) {
-        if let Self::Ordered = self {
+        if let Self::Ordered = self
+            && state.guard.is_none()
+        {
             let frame = &mut state.search.as_mut().expect("ordered search").current;
-            frame.position = ArmPosition::Selected(frame.position.constructors());
+            let set = frame.position.constructors();
+            frame.position = ArmPosition::Selected(set);
+            if set.0 == [true, true] {
+                // Project the arm's own overlay; the next arm still needs the routing cells.
+                for value in state.bindings.values_mut() {
+                    value.provenance.forget_constructors(None);
+                }
+            }
         }
     }
 
@@ -119,7 +129,7 @@ impl MatchPaths {
                         routes.discard_write(id);
                     }
                 }
-                routes.current.position = ArmPosition::Matching(ConstructorSet([false; 2]));
+                routes.current.position = ArmPosition::Routing(ConstructorSet([false; 2]));
             }
         }
     }
@@ -218,7 +228,7 @@ impl SearchFrame {
             enclosing_guard,
             enclosing,
             cells: BTreeMap::new(),
-            position: ArmPosition::Matching(ConstructorSet([false; 2])),
+            position: ArmPosition::Routing(ConstructorSet([false; 2])),
             exits: [0; 2],
         }
     }
@@ -228,7 +238,10 @@ impl SearchFrame {
         match self.position.constructors().0 {
             [true, false] => Some(&cell.values[0]),
             [false, true] => Some(&cell.values[1]),
-            [true, true] => Some(&cell.joined),
+            [true, true] => Some(match self.position {
+                ArmPosition::Routing(_) => cell.shared_guard(),
+                ArmPosition::Selected(_) => cell.shared_body(),
+            }),
             [false, false] => None,
         }
     }
@@ -236,30 +249,27 @@ impl SearchFrame {
 
 #[derive(Clone, Copy)]
 enum ArmPosition {
-    Matching(ConstructorSet),
+    // Also used inside a body while an enclosing guard is still being evaluated.
+    Routing(ConstructorSet),
     Selected(ConstructorSet),
 }
 
 impl ArmPosition {
     fn constructors(self) -> ConstructorSet {
         match self {
-            Self::Matching(set) | Self::Selected(set) => set,
+            Self::Routing(set) | Self::Selected(set) => set,
         }
     }
 
-    // A pair of referents belongs to this search. Only a selected singleton
-    // has no remaining outer constructor distinction for a child to misread.
     fn can_nest(self) -> bool {
-        matches!(
-            self,
-            Self::Selected(ConstructorSet([true, false] | [false, true]))
-        )
+        matches!(self, Self::Selected(set) if set.0 != [false; 2])
     }
 }
 
 struct SearchCell {
     values: [BindingState; 2],
-    joined: BindingState,
+    guard_entry: OnceCell<Box<BindingState>>,
+    body_entry: OnceCell<Box<BindingState>>,
     sampled: [usize; 2],
     output: Option<BindingState>,
 }
@@ -267,11 +277,54 @@ struct SearchCell {
 impl SearchCell {
     fn new(base: BindingState) -> Self {
         Self {
-            values: [base.clone(), base.clone()],
-            joined: base,
+            values: [base.clone(), base],
+            guard_entry: OnceCell::new(),
+            body_entry: OnceCell::new(),
             sampled: [0; 2],
             output: None,
         }
+    }
+
+    fn shared_guard(&self) -> &BindingState {
+        self.guard_entry.get_or_init(|| {
+            #[cfg(test)]
+            tests::observe_shared_entry();
+            let [a, b] = &self.values;
+            Box::new(BindingState {
+                availability: a.availability.join(b.availability),
+                provenance: ValueProvenance::from_constructors(&a.provenance, &b.provenance),
+            })
+        })
+    }
+
+    fn shared_body(&self) -> &BindingState {
+        self.body_entry.get_or_init(|| {
+            #[cfg(test)]
+            tests::observe_shared_entry();
+            let [a, b] = &self.values;
+            let mut joined = a.clone();
+            joined.join_choice(b.clone(), None);
+            Box::new(joined)
+        })
+    }
+
+    fn write_guard(&mut self, active: [bool; 2], value: &BindingState) {
+        let [a, b] = &self.values;
+        let availability = match active {
+            [true, false] => a.availability,
+            [false, true] => b.availability,
+            _ => a.availability.join(b.availability),
+        };
+        for (i, selected) in active.into_iter().enumerate() {
+            if selected {
+                if availability != value.availability {
+                    self.values[i].availability = value.availability;
+                }
+                self.values[i].provenance = value.provenance.for_constructor(i);
+            }
+        }
+        self.guard_entry.take();
+        self.body_entry.take();
     }
 
     fn sample_value(&mut self, value: BindingState, guard: Option<usize>) {
@@ -335,28 +388,7 @@ impl ConstructorPaths {
         );
         let cell = self.cell(id);
         cell.flush(exits, guard);
-        let entry_availability = match active {
-            [true, false] => cell.values[0].availability,
-            [false, true] => cell.values[1].availability,
-            _ => cell.joined.availability,
-        };
-        for (i, selected) in active.into_iter().enumerate() {
-            if selected {
-                if entry_availability != value.availability {
-                    cell.values[i].availability = value.availability;
-                }
-                cell.values[i].provenance = value.provenance.for_constructor(i);
-            }
-        }
-        cell.joined = BindingState {
-            availability: cell.values[0]
-                .availability
-                .join(cell.values[1].availability),
-            provenance: ValueProvenance::from_constructors(
-                &cell.values[0].provenance,
-                &cell.values[1].provenance,
-            ),
-        };
+        cell.write_guard(active, value);
     }
 
     fn sample(&mut self, writes: Bindings) {

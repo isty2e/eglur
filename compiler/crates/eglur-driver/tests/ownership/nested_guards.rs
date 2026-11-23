@@ -110,23 +110,80 @@ fn main!() -> Unit { _ = f(None, None, 1, 2, false) }";
 }
 
 #[test]
-fn two_enclosing_constructors_cannot_be_relabelled_as_the_inner_pair() {
-    let source = "fn peek(_v: &i64) -> i64 = 0
-fn f(outer: Opt[i64], inner: Opt[i64], a: i64, b: i64, flag: Bool) -> i64 {
-let mut p = &a
-let mut q = &a
-return match outer {
-    Some(_) if { p = &b
-yield flag } => 0,
-    _ => match inner { Some(_) if { q = p
-yield flag } => 1, Some(_) => { let r = own a
+fn a_shared_body_and_its_sequential_spelling_borrow_the_same_roots() {
+    let source = |nested: bool, copy: bool, consumed: &str| {
+        let (before, referent) = if copy {
+            ("let saved = p\n", "saved")
+        } else {
+            ("", "p")
+        };
+        let inner = format!(
+            "match inner {{ Some(_) if {{ q = {referent}
+yield flag }} => 1, Some(_) => {{ let r = own {consumed}
 let n = peek(q)
 drop_own move r
-yield n }, None => 2 } } }
-fn main!() -> Unit { _ = f(None, Some(1), 1, 2, false)
-_ = f(Some(0), Some(1), 1, 2, false) }";
-    incomplete(source);
-    incomplete(&source.replace("let r = own a", "let r = own b"));
+yield n }}, None => 2 }}"
+        );
+        let body = if nested {
+            format!(
+                "return match outer {{ Some(_) if {{ p = &b
+yield early }} => 0, _ => {{ {before}yield {inner} }} }}"
+            )
+        } else {
+            format!(
+                "let step: Unit = match outer {{ Some(_) => {{ p = &b
+if early {{ return 0 }}
+yield () }}, None => () }}
+{before}return {inner}"
+            )
+        };
+        format!(
+            "fn peek(_v: &i64) -> i64 = 0
+fn f(outer: Opt[i64], inner: Opt[i64], a: i64, b: i64, c: i64, early: Bool, flag: Bool) -> i64 {{
+let mut p = &a
+let mut q = &a
+{body} }}
+fn main!() -> Unit {{ _ = f(None, Some(1), 1, 2, 3, false, false)
+_ = f(Some(0), Some(1), 1, 2, 3, false, false) }}"
+        )
+    };
+
+    for copy in [false, true] {
+        for nested in [false, true] {
+            checked(&source(nested, copy, "c"), &[]);
+            for consumed in ["a", "b"] {
+                let source = source(nested, copy, consumed);
+                let snapshot = checked(&source, &["OWNERSHIP_USE_AFTER_DISCHARGE"]);
+                let span = snapshot.diagnostics()[0]
+                    .primary_span()
+                    .as_source()
+                    .unwrap()
+                    .file_span()
+                    .range();
+                assert_eq!(
+                    span.start().as_usize(),
+                    source.find("peek(q)").unwrap() + "peek(".len()
+                );
+                assert_eq!(&source[span.start().as_usize()..span.end().as_usize()], "q");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unchanged_assignment_stays_unchanged_across_a_nested_match() {
+    let source = "fn f(o: Opt[i64], i: Opt[i64], a: i64, b: i64, flag: Bool) -> i64 {
+let mut p = &a
+let mut q = &a
+return match o { Some(_) if { p = &b
+q = &b
+yield flag } => 0, _ => {
+let first = match i { Some(_) if flag => { q = p
+yield 1 }, _ => 2 }
+yield match i { Some(0) if { q = p
+yield flag } => 3, _ => 4 } } } }
+fn main!() -> Unit { _ = f(None, Some(0), 1, 2, false) }";
+    checked(source, &[]);
 }
 
 #[test]
@@ -189,6 +246,33 @@ fn main!() -> Unit {{ _ = f(Some(0), Some(1), None, 127, 1, 2, true, false) }}")
             &source.replace("q = p\nlet t", "q = &a\nlet t"),
             &["OWNERSHIP_USE_AFTER_DISCHARGE"],
         );
+    }
+}
+
+#[test]
+fn a_caught_failure_in_a_shared_body_keeps_both_possible_referents() {
+    let source = "fn peek(_v: &i64) -> i64 = 0
+fn f(outer: Res[i64, i64], inner: Opt[i64], more: Opt[i64], a: i64, b: i64, c: i64, spare: i64, flag: Bool) -> i64 {
+let mut p = &a
+let mut q = &c
+return match outer { Ok(_) if { p = &b
+yield flag } => 0, _ => {
+let caught: Opt[i64] = result { let n = match inner { Some(_) if { q = p
+yield flag } => 1, Some(_) => { let v = more?
+yield v }, None => 2 }
+q = &c
+yield Some(n) }
+let r = own spare
+let n = peek(q)
+drop_own move r
+yield n } } }
+fn main!() -> Unit { _ = f(Ok(0), Some(1), None, 1, 2, 3, 4, false)
+_ = f(Err(0), Some(1), None, 1, 2, 3, 4, false) }";
+    checked(source, &[]);
+    for consumed in ["a", "b"] {
+        let source = source.replace("own spare", &format!("own {consumed}"));
+        checked(&source, &["OWNERSHIP_USE_AFTER_DISCHARGE"]);
+        checked(&source.replace("let v = more?", "let v = 1"), &[]);
     }
 }
 
