@@ -1,3 +1,4 @@
+mod branches;
 mod traversal;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,7 @@ use super::{
     OwnershipAvailability, OwnershipBodyStatus, OwnershipBodySummary, OwnershipFailure,
     OwnershipFailureKind, OwnershipRootFact,
 };
+use branches::{Alternatives, FlowState, RecoverableExits};
 
 pub(crate) struct OwnershipBodyAnalysis {
     pub(crate) summary: OwnershipBodySummary,
@@ -39,20 +41,34 @@ impl AvailabilityFact {
             first_consume: None,
         }
     }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            state: self.state.join(other.state),
+            first_consume: match (self.first_consume, other.first_consume) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+        }
+    }
 }
 
-#[derive(Clone, Default)]
-struct FlowState {
-    availability: BTreeMap<LocalBindingId, AvailabilityFact>,
-    aliases: BTreeMap<LocalBindingId, ValueProvenance>,
+impl Default for AvailabilityFact {
+    fn default() -> Self {
+        Self::owned()
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ValueProvenance {
     roots_by_tuple_path: BTreeMap<Vec<usize>, BTreeSet<LocalBindingId>>,
 }
 
 impl ValueProvenance {
+    fn is_empty(&self) -> bool {
+        self.roots_by_tuple_path.is_empty()
+    }
+
     fn direct(roots: BTreeSet<LocalBindingId>) -> Self {
         let mut provenance = Self::default();
         if !roots.is_empty() {
@@ -112,62 +128,6 @@ impl ValueProvenance {
             .flatten()
             .copied()
             .collect()
-    }
-}
-
-impl FlowState {
-    fn join(states: &[Self]) -> Self {
-        debug_assert!(!states.is_empty());
-        let availability_keys = states
-            .iter()
-            .flat_map(|state| state.availability.keys().copied())
-            .collect::<BTreeSet<_>>();
-        let mut availability = BTreeMap::new();
-        for binding in availability_keys {
-            let mut joined = AvailabilityFact::owned();
-            let mut first = true;
-            for state in states {
-                let incoming = state
-                    .availability
-                    .get(&binding)
-                    .copied()
-                    .unwrap_or_else(AvailabilityFact::owned);
-                if first {
-                    joined = incoming;
-                    first = false;
-                } else {
-                    joined.state = joined.state.join(incoming.state);
-                    joined.first_consume = match (joined.first_consume, incoming.first_consume) {
-                        (Some(left), Some(right)) => Some(left.min(right)),
-                        (Some(origin), None) | (None, Some(origin)) => Some(origin),
-                        (None, None) => None,
-                    };
-                }
-            }
-            availability.insert(binding, joined);
-        }
-
-        let alias_keys = states
-            .iter()
-            .flat_map(|state| state.aliases.keys().copied())
-            .collect::<BTreeSet<_>>();
-        let aliases = alias_keys
-            .into_iter()
-            .map(|binding| {
-                let mut provenance = ValueProvenance::default();
-                for incoming in states
-                    .iter()
-                    .filter_map(|state| state.aliases.get(&binding))
-                {
-                    provenance.extend(incoming.clone());
-                }
-                (binding, provenance)
-            })
-            .collect();
-        Self {
-            availability,
-            aliases,
-        }
     }
 }
 
@@ -324,7 +284,7 @@ struct BodyAnalyzer<'analysis> {
     failures: Vec<OwnershipFailure>,
     operation_count: usize,
     unperformed: bool,
-    recoverable_exits: Vec<(ControlRegionKey, Vec<FlowState>)>,
+    recoverable_exits: Vec<(ControlRegionKey, RecoverableExits)>,
 }
 
 impl BodyAnalyzer<'_> {
@@ -369,7 +329,7 @@ impl BodyAnalyzer<'_> {
         };
         self.use_binding(binding, origin, state);
         let provenance = if self.binding_contains_reference(binding)? {
-            state.aliases.get(&binding).cloned().unwrap_or_default()
+            state.alias(binding).cloned().unwrap_or_default()
         } else {
             ValueProvenance::default()
         };
@@ -399,9 +359,8 @@ impl BodyAnalyzer<'_> {
     ) {
         for (origin, roots) in in_flight {
             for &root in roots {
-                if let Some(fact) = state.availability.get(&root)
-                    && fact.state != OwnershipAvailability::Owned
-                {
+                let fact = state.availability(root);
+                if fact.state != OwnershipAvailability::Owned {
                     self.failures.push(OwnershipFailure::new(
                         self.owner,
                         OwnershipFailureKind::UseAfterDischarge,
@@ -433,22 +392,78 @@ impl BodyAnalyzer<'_> {
         let bindings = self
             .names
             .pattern_bindings(self.module, self.body, pattern)?;
-        let receives_root = bindings
-            .iter()
-            .copied()
-            .map(|binding| self.binding_is_root(binding))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .any(|is_root| is_root);
-        if receives_root {
-            self.recover_missing_move(initializer, state)?;
-        }
+        let mut recovered_transfer = false;
         for binding in bindings {
             if self.binding_is_root(binding)? {
+                if !recovered_transfer {
+                    self.recover_missing_move(initializer, state)?;
+                    recovered_transfer = true;
+                }
                 self.introduce_root(binding, state)?;
-            } else if self.binding_contains_reference(binding)? {
-                self.record_local_region(binding);
-                state.aliases.insert(binding, flow.provenance.clone());
+            }
+        }
+        self.bind_pattern_provenance(pattern, &flow.provenance, state)
+    }
+
+    fn bind_pattern_provenance(
+        &mut self,
+        pattern: PatternId,
+        subject: &ValueProvenance,
+        state: &mut FlowState,
+    ) -> Result<(), OwnershipAnalysisError> {
+        use std::borrow::Cow;
+
+        if subject.is_empty() {
+            return Ok(());
+        }
+        let mut pending = vec![(pattern, Cow::Borrowed(subject))];
+        while let Some((id, provenance)) = pending.pop() {
+            let pattern = self
+                .body
+                .pattern(id)
+                .ok_or(OwnershipAnalysisError::WrongBodyPattern(id))?;
+            match pattern.kind() {
+                PatternKind::Binding(name) | PatternKind::Alias { name, .. } => {
+                    let binding = self
+                        .names
+                        .body_bindings(self.module, self.body.id())
+                        .and_then(|bindings| {
+                            bindings.binding(crate::resolve::PatternBindingSite::Name(id))
+                        })
+                        .ok_or(OwnershipAnalysisError::MissingLocalOrigin {
+                            module: self.module,
+                            body: self.body.id(),
+                            origin: name.origin(),
+                        })?;
+                    let holds_reference = self.binding_contains_reference(binding)?;
+                    if holds_reference {
+                        self.record_local_region(binding);
+                    }
+                    if let PatternKind::Alias { pattern, .. } = pattern.kind() {
+                        if holds_reference {
+                            state.set_alias(binding, provenance.as_ref().clone());
+                        }
+                        pending.push((*pattern, provenance));
+                    } else if holds_reference {
+                        state.set_alias(binding, provenance.into_owned());
+                    }
+                }
+                PatternKind::Group(inner) => pending.push((*inner, provenance)),
+                PatternKind::Tuple(elements) => {
+                    for (index, element) in elements.iter().enumerate().rev() {
+                        if let eglur_hir::PatternElement::Pattern(inner) = element {
+                            let projected = provenance.projected(index);
+                            if !projected.is_empty() {
+                                pending.push((*inner, Cow::Owned(projected)));
+                            }
+                        }
+                    }
+                }
+                PatternKind::Wildcard | PatternKind::Unit | PatternKind::Literal(_) => {}
+                PatternKind::Or(_)
+                | PatternKind::Struct { .. }
+                | PatternKind::Variant { .. }
+                | PatternKind::Invalid => self.unperformed = true,
             }
         }
         Ok(())
@@ -469,18 +484,13 @@ impl BodyAnalyzer<'_> {
         self.roots
             .entry(binding)
             .or_insert_with(|| local.region().clone());
-        state
-            .availability
-            .insert(binding, AvailabilityFact::owned());
+        state.set_availability(binding, AvailabilityFact::owned());
         Ok(())
     }
 
     fn consume_root(&mut self, binding: LocalBindingId, origin: OriginId, state: &mut FlowState) {
         self.record_local_region(binding);
-        let fact = state
-            .availability
-            .entry(binding)
-            .or_insert_with(AvailabilityFact::owned);
+        let mut fact = state.availability(binding);
         match fact.state {
             OwnershipAvailability::Owned => {
                 fact.state = OwnershipAvailability::Consumed;
@@ -498,17 +508,16 @@ impl BodyAnalyzer<'_> {
                 ));
             }
         }
+        state.set_availability(binding, fact);
     }
 
     fn consume_source(&mut self, binding: LocalBindingId, origin: OriginId, state: &mut FlowState) {
         self.record_local_region(binding);
-        let fact = state
-            .availability
-            .entry(binding)
-            .or_insert_with(AvailabilityFact::owned);
+        let mut fact = state.availability(binding);
         if fact.state == OwnershipAvailability::Owned {
             fact.state = OwnershipAvailability::Consumed;
             fact.first_consume = Some(origin);
+            state.set_availability(binding, fact);
             return;
         }
         self.failures.push(OwnershipFailure::new(
@@ -519,12 +528,12 @@ impl BodyAnalyzer<'_> {
             fact.first_consume,
         ));
         fact.state = OwnershipAvailability::Consumed;
+        state.set_availability(binding, fact);
     }
 
     fn use_binding(&mut self, binding: LocalBindingId, origin: OriginId, state: &FlowState) {
-        if let Some(fact) = state.availability.get(&binding)
-            && fact.state != OwnershipAvailability::Owned
-        {
+        let fact = state.availability(binding);
+        if fact.state != OwnershipAvailability::Owned {
             self.failures.push(OwnershipFailure::new(
                 self.owner,
                 OwnershipFailureKind::UseAfterDischarge,
@@ -533,16 +542,15 @@ impl BodyAnalyzer<'_> {
                 fact.first_consume,
             ));
         }
-        if let Some(provenance) = state.aliases.get(&binding) {
+        if let Some(provenance) = state.alias(binding) {
             self.use_roots(&provenance.roots(), origin, state);
         }
     }
 
     fn use_roots(&mut self, roots: &BTreeSet<LocalBindingId>, origin: OriginId, state: &FlowState) {
         for &root in roots {
-            if let Some(fact) = state.availability.get(&root)
-                && fact.state != OwnershipAvailability::Owned
-            {
+            let fact = state.availability(root);
+            if fact.state != OwnershipAvailability::Owned {
                 self.failures.push(OwnershipFailure::new(
                     self.owner,
                     OwnershipFailureKind::UseAfterDischarge,
@@ -608,14 +616,12 @@ impl BodyAnalyzer<'_> {
         state: &mut FlowState,
     ) {
         self.record_local_region(binding);
-        let fact = state
-            .availability
-            .entry(binding)
-            .or_insert_with(AvailabilityFact::owned);
+        let mut fact = state.availability(binding);
         if fact.state == OwnershipAvailability::Owned {
             fact.first_consume = Some(origin);
         }
         fact.state = OwnershipAvailability::Consumed;
+        state.set_availability(binding, fact);
     }
 
     fn named_root(
@@ -652,7 +658,7 @@ impl BodyAnalyzer<'_> {
         let source = ControlTransferSource::Expression(key);
         let body_types = self.body_types;
         for transfer in body_types.transfers_from(&source) {
-            let mut exit_state = state.clone();
+            let mut exit_state = state.exit_snapshot();
             self.check_transfer(transfer, origin, false, &mut exit_state)?;
             if let Some((_, exits)) = self
                 .recoverable_exits
@@ -660,7 +666,7 @@ impl BodyAnalyzer<'_> {
                 .rev()
                 .find(|(region, _)| region == transfer.target())
             {
-                exits.push(exit_state);
+                exits.include(exit_state);
             }
         }
         Ok(())
@@ -696,34 +702,27 @@ impl BodyAnalyzer<'_> {
             .copied()
             .collect::<BTreeSet<_>>();
         for &binding in &bindings {
-            if self.roots.contains_key(&binding)
-                && state
-                    .availability
-                    .get(&binding)
-                    .map_or(OwnershipAvailability::Owned, |fact| fact.state)
-                    != OwnershipAvailability::Consumed
-            {
-                let related = state
-                    .availability
-                    .get(&binding)
-                    .and_then(|fact| fact.first_consume);
+            let fact = state.availability(binding);
+            if self.roots.contains_key(&binding) && fact.state != OwnershipAvailability::Consumed {
                 let failure = OwnershipFailure::new(
                     self.owner,
                     OwnershipFailureKind::PathUnbalanced,
                     origin,
                     binding,
-                    related,
+                    fact.first_consume,
                 );
                 self.failures.push(if closing_delimiter {
                     failure.at_closing_delimiter()
                 } else {
                     failure
                 });
+                // All failures on this edge have the same span and code.
+                // Binding order selects the first witness.
+                break;
             }
         }
         for binding in bindings {
-            state.availability.remove(&binding);
-            state.aliases.remove(&binding);
+            state.end_binding(binding);
         }
         Ok(())
     }
@@ -744,8 +743,7 @@ impl BodyAnalyzer<'_> {
             match place.kind() {
                 TypedPlaceKind::Local(binding) if self.binding_is_reference(*binding)? => {
                     return Ok(state
-                        .aliases
-                        .get(binding)
+                        .alias(*binding)
                         .map(ValueProvenance::roots)
                         .unwrap_or_default());
                 }

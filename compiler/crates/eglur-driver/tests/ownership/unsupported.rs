@@ -6,9 +6,9 @@ use eglur_driver::{
 use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct, SemanticLocation};
 
 const OWNERSHIP_MATCH: &str = concat!(
-    "fn discharge(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
-    "  None => { drop_own move root\nyield 0 },\n",
-    "  Some(value) => { drop_own move root\nyield value }\n",
+    "fn discharge(input: Opt[Own[i64]]) -> i64 = match move input {\n",
+    "  None => 0,\n",
+    "  Some(value) => { drop_own move value\nyield 1 }\n",
     "}\n",
 );
 
@@ -45,6 +45,9 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
                     "fn choose(input: Opt[i64]) -> Own[i64] = match input {\n",
                     "  None => make(1), Some(value) => make(value)\n",
                     "}\n",
+                    "fn release(input: Res[Own[i64], Str]) -> Unit = match move input {\n",
+                    "  Ok(value) => { drop_own move value }, Err(_) => ()\n",
+                    "}\n",
                 )
                 .as_bytes()
                 .to_vec(),
@@ -72,7 +75,7 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
             .filter(|declaration| declaration.kind() == DeclarationKind::Function)
         {
             let name = declaration.name().unwrap().spelling();
-            let status = if matches!(name.as_str(), "discharge" | "choose") {
+            let status = if matches!(name.as_str(), "discharge" | "release") {
                 expected_locations.push(SemanticLocation::origin(
                     module.file(),
                     declaration.origin(),

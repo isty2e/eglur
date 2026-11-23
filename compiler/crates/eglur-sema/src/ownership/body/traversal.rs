@@ -44,9 +44,16 @@ impl ValueSequence {
 struct IfFrame {
     owner: ExpressionKey,
     remaining: std::array::IntoIter<(IfBranch, Option<ExprId>), 3>,
-    entry: FlowState,
-    continuing_states: Vec<FlowState>,
+    branches: Alternatives,
     provenance: ValueProvenance,
+}
+
+struct MatchFrame<'hir> {
+    owner: ExpressionKey,
+    remaining: std::iter::Enumerate<std::slice::Iter<'hir, eglur_hir::MatchArm>>,
+    branches: Alternatives,
+    subject: ValueProvenance,
+    result: ValueProvenance,
 }
 
 enum TransferKind {
@@ -76,6 +83,9 @@ enum Step<'hir> {
     IfCondition(ExpressionKey, &'hir eglur_hir::IfExpr),
     IfNext(IfFrame),
     IfValue(IfFrame),
+    MatchSubject(ExpressionKey, &'hir eglur_hir::MatchExpr),
+    MatchNext(MatchFrame<'hir>),
+    MatchValue(MatchFrame<'hir>, ControlRegionKey, OriginId),
     BlockNext(BlockFrame<'hir>),
     BlockValue(BlockFrame<'hir>),
     ValuesNext(ValueSequence),
@@ -141,8 +151,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                     })?;
                     flow.provenance = match receiver {
                         ProjectionReceiver::LocalAlias(binding) => state
-                            .aliases
-                            .get(&binding)
+                            .alias(binding)
                             .map(|provenance| provenance.projected(index))
                             .unwrap_or_default(),
                         ProjectionReceiver::Value => flow.provenance.projected(index),
@@ -151,18 +160,12 @@ impl<'hir> BodyAnalyzer<'hir> {
                 }
                 Step::RecoverMove(id) => self.recover_missing_move(id, state)?,
                 Step::Recoverable(region) => {
-                    let (recorded_region, mut exits) = self
+                    let (recorded_region, exits) = self
                         .recoverable_exits
                         .pop()
                         .expect("recoverable region collector is balanced");
                     debug_assert_eq!(recorded_region, region);
-                    if flow.continuing {
-                        exits.push(state.clone());
-                    }
-                    if !exits.is_empty() {
-                        *state = FlowState::join(&exits);
-                        flow.continuing = true;
-                    }
+                    flow.continuing = exits.finish(state, flow.continuing);
                 }
                 Step::IfCondition(owner, expression) => {
                     if flow.continuing {
@@ -174,8 +177,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                                 (IfBranch::Unknown, expression.unknown_branch),
                             ]
                             .into_iter(),
-                            entry: state.clone(),
-                            continuing_states: Vec::new(),
+                            branches: Alternatives::begin(state),
                             provenance: ValueProvenance::default(),
                         }));
                     } else {
@@ -190,10 +192,58 @@ impl<'hir> BodyAnalyzer<'hir> {
                         frame
                             .provenance
                             .extend(std::mem::take(&mut flow.provenance));
-                        frame.continuing_states.push(std::mem::take(state));
                     }
-                    *state = frame.entry.clone();
+                    frame.branches.finish_arm(state, flow.continuing);
                     pending.push(Step::IfNext(frame));
+                }
+                Step::MatchSubject(owner, value) => {
+                    if flow.continuing {
+                        let key = ExpressionKey::new(self.module, value.scrutinee);
+                        let FactState::Known(typed) = self.body_types.expression(key) else {
+                            return Err(OwnershipAnalysisError::MissingExpressionType(key));
+                        };
+                        let subject = if self.signatures.types().contains_reference(typed.ty())? {
+                            std::mem::take(&mut flow.provenance)
+                        } else {
+                            ValueProvenance::default()
+                        };
+                        pending.push(Step::MatchNext(MatchFrame {
+                            owner,
+                            remaining: value.arms.iter().enumerate(),
+                            branches: Alternatives::begin(state),
+                            subject,
+                            result: ValueProvenance::default(),
+                        }));
+                    }
+                }
+                Step::MatchNext(mut frame) => {
+                    if let Some((arm, value)) = frame.remaining.next() {
+                        let region = ControlRegionKey::MatchArm {
+                            owner: frame.owner,
+                            arm,
+                        };
+                        self.bind_pattern_provenance(value.pattern, &frame.subject, state)?;
+                        pending.push(Step::MatchValue(frame, region, value.origin));
+                        pending.push(Step::Expression(value.value, None));
+                    } else {
+                        flow = ExpressionFlow {
+                            continuing: frame.branches.finish(state),
+                            provenance: frame.result,
+                        };
+                    }
+                }
+                Step::MatchValue(mut frame, region, origin) => {
+                    if flow.continuing {
+                        self.check_transfer_source(
+                            &ControlTransferSource::RegionCompletion(region),
+                            origin,
+                            false,
+                            state,
+                        )?;
+                        frame.result.extend(std::mem::take(&mut flow.provenance));
+                    }
+                    frame.branches.finish_arm(state, flow.continuing);
+                    pending.push(Step::MatchNext(frame));
                 }
                 Step::BlockNext(mut frame) => {
                     if flow.continuing {
@@ -289,9 +339,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                         && flow.continuing
                     {
                         self.record_local_region(binding);
-                        state
-                            .aliases
-                            .insert(binding, std::mem::take(&mut flow.provenance));
+                        state.set_alias(binding, std::mem::take(&mut flow.provenance));
                     }
                     flow = ExpressionFlow {
                         continuing: target_continues && flow.continuing,
@@ -417,7 +465,8 @@ impl<'hir> BodyAnalyzer<'hir> {
                 } else {
                     ControlRegionKey::Checked(key)
                 };
-                self.recoverable_exits.push((region.clone(), Vec::new()));
+                self.recoverable_exits
+                    .push((region.clone(), RecoverableExits::default()));
                 pending.push(Step::Recoverable(region.clone()));
                 pending.push(Step::Expression(*inner, Some(region)));
             }
@@ -426,19 +475,34 @@ impl<'hir> BodyAnalyzer<'hir> {
                 pending.push(Step::Expression(value.condition, None));
             }
             ExprKind::Match(value) => {
-                self.unperformed = true;
-                let children = [value.scrutinee]
-                    .into_iter()
-                    .chain(value.arms.iter().flat_map(|arm| {
-                        arm.guard
-                            .iter()
-                            .map(|guard| guard.condition)
-                            .chain([arm.value])
-                    }));
-                pending.push(Step::ValuesNext(ValueSequence::new(
-                    children,
-                    ValueSequenceKind::Discard,
-                )));
+                let subject = self
+                    .body_types
+                    .expression(ExpressionKey::new(self.module, value.scrutinee));
+                if let FactState::Known(typed) = subject
+                    && self
+                        .signatures
+                        .types()
+                        .ownership_root(typed.ty())?
+                        .is_none()
+                    && value.arms.iter().all(|arm| arm.guard.is_none())
+                {
+                    pending.push(Step::MatchSubject(key, value));
+                    pending.push(Step::Expression(value.scrutinee, None));
+                } else {
+                    self.unperformed = true;
+                    let children = [value.scrutinee]
+                        .into_iter()
+                        .chain(value.arms.iter().flat_map(|arm| {
+                            arm.guard
+                                .iter()
+                                .map(|guard| guard.condition)
+                                .chain([arm.value])
+                        }));
+                    pending.push(Step::ValuesNext(ValueSequence::new(
+                        children,
+                        ValueSequenceKind::Discard,
+                    )));
+                }
             }
             ExprKind::Tuple(values) => pending.push(Step::ValuesNext(ValueSequence::new(
                 values.iter().copied(),
@@ -640,7 +704,7 @@ impl<'hir> BodyAnalyzer<'hir> {
         for (branch, value) in frame.remaining.by_ref() {
             let Some(value) = value else {
                 if matches!(branch, IfBranch::Else) {
-                    frame.continuing_states.push(frame.entry.clone());
+                    frame.branches.unchanged_path();
                 }
                 continue;
             };
@@ -652,12 +716,8 @@ impl<'hir> BodyAnalyzer<'hir> {
             pending.push(Step::Expression(value, Some(region)));
             return;
         }
-        let continuing = !frame.continuing_states.is_empty();
-        if continuing {
-            *state = FlowState::join(&frame.continuing_states);
-        }
         *flow = ExpressionFlow {
-            continuing,
+            continuing: frame.branches.finish(state),
             provenance: frame.provenance,
         };
     }
