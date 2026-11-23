@@ -759,21 +759,22 @@ impl CanonicalTypeStore {
             NominalHead::Intrinsic(IntrinsicNominal::Own) => Ok(Some(OwnershipRoot::Direct {
                 payload: arguments[0],
             })),
-            NominalHead::Intrinsic(IntrinsicNominal::Opt) => {
-                let Some(OwnershipRoot::Direct { payload }) = self.ownership_root(arguments[0])?
+            NominalHead::Intrinsic(carrier @ (IntrinsicNominal::Opt | IntrinsicNominal::Res)) => {
+                let TypeKind::Nominal {
+                    head: NominalHead::Intrinsic(IntrinsicNominal::Own),
+                    substitution: inner,
+                } = self.kind(arguments[0])?
                 else {
                     return Ok(None);
                 };
-                Ok(Some(OwnershipRoot::Optional { payload }))
-            }
-            NominalHead::Intrinsic(IntrinsicNominal::Res) => {
-                let Some(OwnershipRoot::Direct { payload }) = self.ownership_root(arguments[0])?
-                else {
-                    return Ok(None);
-                };
-                Ok(Some(OwnershipRoot::Result {
-                    payload,
-                    error: arguments[1],
+                let payload = self.substitution(*inner)?[0];
+                Ok(Some(if *carrier == IntrinsicNominal::Opt {
+                    OwnershipRoot::Optional { payload }
+                } else {
+                    OwnershipRoot::Result {
+                        payload,
+                        error: arguments[1],
+                    }
                 }))
             }
             _ => Ok(None),
@@ -1404,6 +1405,22 @@ mod tests {
         );
         assert_eq!(store.ownership_root(tuple).unwrap(), None);
         assert!(store.contains_ownership(tuple).unwrap());
+
+        let opt = NominalHead::Intrinsic(IntrinsicNominal::Opt);
+        let optional = store.nominal(opt.clone(), [owned]).unwrap();
+        assert_eq!(
+            store.ownership_root(optional).unwrap(),
+            Some(OwnershipRoot::Optional { payload })
+        );
+        let nested = store.nominal(opt.clone(), [result]).unwrap();
+        assert_eq!(store.ownership_root(nested).unwrap(), None);
+        assert!(store.contains_ownership(nested).unwrap());
+
+        let mut deep = payload;
+        for _ in 0..4_096 {
+            deep = store.nominal(opt.clone(), [deep]).unwrap();
+        }
+        assert_eq!(store.ownership_root(deep).unwrap(), None);
     }
 
     #[test]
