@@ -68,7 +68,8 @@ Rules:
 
 ### Root Creation and Transfer
 
-Each binding whose static type is an ownership-root type is an ownership root.
+A binding of ownership-root type establishes an ownership obligation. For a
+consuming pattern, that obligation begins when the arm is selected, after its guard.
 A fresh ownership-bearing temporary produced by `own`, a call, or a constructor
 MUST be immediately established as a root, transferred to an allowed result or
 carrier, or consumed by the carrier operations below.
@@ -155,6 +156,16 @@ Rules:
    2. `move`, `drop_own`, by-value transfer, and every other consuming use of a tentative ownership binding MUST fail with `OWNERSHIP_GUARD_CONSUME_FORBIDDEN`,
    3. a guard-false path retains the complete moved scrutinee inside match evaluation for later arms,
    4. a guard-true path ends any guard borrow before the selected arm acquires the root bound under Rule 9.
+   5. If a typed control-flow edge leaves the match during a guard and that
+      arm can select a present payload under Rule 9.3, compilation MUST fail
+      with `OWNERSHIP_PATH_UNBALANCED` at the exiting construct. Use the
+      current pattern and the coverage of preceding unguarded arms; a guard
+      that evaluates to false does not rule out that variant.
+   6. Apply Rule 10.5 to each match the edge leaves during guard evaluation.
+      For example, returning from a `whole @ None` guard leaves no payload
+      behind, but the same return still fails if it also leaves a pending
+      `Some(x)` guard. A `?` caught by a `result` inside the guard does not
+      leave that match. Other roots follow the ordinary region-exit rules.
 11. Move-binding patterns such as `Some(move x)` are not part of the v0.1 pattern surface.
 12. Borrow-only carrier queries whose receiver is `&Self` MAY inspect a conditional root without consuming it.
 13. Ordinary by-value generic adapters on `Opt` or `Res` are not available when their type arguments form a conditional ownership root unless this section explicitly defines the operation.

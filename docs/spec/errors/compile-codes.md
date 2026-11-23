@@ -3649,6 +3649,9 @@ Severity: `error`
 Trigger: for enabled ownership surface, a typed control-flow edge exits a
 lexical obligation region while a root belonging to that region is not
 definitely consumed after accounting for transfers through the edge.
+The same code applies when a typed exit leaves a consuming match during a
+guard that can still select a present ownership payload; see
+[Conditional Root Carriers](../language/ownership-boundary.md#conditional-root-carriers).
 
 This applies to bang and non-bang bodies, direct roots `Own[T]`, conditional roots `Opt[Own[T]]` / `Res[Own[T], E]`, and local roots introduced by fresh or moved ownership values.
 

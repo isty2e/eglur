@@ -15235,6 +15235,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-checked-fault-crosses-pending-some"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn finish(v: Opt[Own[i64]], value: i8) -> Res[Str, NumericError] = checked {\n  yield match move v {\n    Some(root) if {\n      let doubled: i8 = value + value // @primary guard-overflow\n      yield match doubled { 0 => true, _ => false }\n    } => {\n      drop_own move root\n      yield \"first\"\n    },\n    rest => {\n      drop_own move rest\n      yield \"fallback\"\n    }\n  }\n}\n\nfn main!() -> Res[Str, NumericError] {\n  let n: i64 = 7\n  yield finish(Some(own n), 64)\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-checked-region-root-must-discharge-before-fault-edge"
       },
       "public_examples": [],
@@ -15523,6 +15541,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-err-guard-return-still-checks-ordinary-root"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn finish(r: Res[Own[i64], Str], other: Own[i64], stop: Bool) -> Str {\n  let label: Str = match move r {\n    Err(reason) if {\n      if stop {\n        return reason // @primary ordinary-root-return\n      }\n      yield true\n    } => reason,\n    rest => {\n      drop_own move rest\n      yield \"fallback\"\n    }\n  }\n  drop_own move other\n  yield label\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 7\n  yield Ok(finish(Err(\"empty\"), own n, true))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-explicit-own-wrapper-may-abstract-ownership-free-generic-payload"
       },
       "public_examples": [],
@@ -15613,6 +15649,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-guard-local-result-and-checked-exits-preserve-carrier"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn retained(v: Opt[Own[i64]], gate: Res[Bool, Str], value: i8) -> Bool = match move v {\n  Some(root) if {\n    let decision: Res[Bool, Str] = result {\n      let take = gate?\n      yield Ok(take)\n    }\n    let doubled: Res[i8, NumericError] = checked { yield value + value }\n    yield match decision {\n      Ok(_) => true,\n      Err(_) => match doubled { Ok(_) => true, Err(_) => false }\n    }\n  } => {\n    drop_own move root\n    yield false\n  },\n  whole => {\n    drop_own move whole\n    yield true\n  }\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 7\n  yield Ok(to_str(retained(Some(own n), Err(\"stop\"), 64)))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-guard-may-shared-borrow-tentative-root"
       },
       "public_examples": [],
@@ -15637,6 +15691,42 @@
       "source": {
         "kind": "utf8",
         "text": "fn bad_guard_paths(x: Own[i64], b: Bool) -> i64 {\n  match b {\n    true if true => {\n      drop_own move x\n      return 1\n    }\n    _ => {\n      return 0\n    }\n  }\n}\n\nfn main!() -> Res[Str, Str] {\n  yield Ok(\"x\")\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-guarded-ok-leaves-payload-at-catch-all-question"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn route(r: Res[Own[i64], Str], first: Bool, gate: Res[Bool, Str]) -> Res[Str, Str] = result {\n  let label: Str = match move r {\n    Ok(root) if first => {\n      drop_own move root\n      yield \"first\"\n    },\n    whole if {\n      let take = gate? // @primary catch-all-question\n      yield take\n    } => {\n      drop_own move whole\n      yield \"second\"\n    },\n    rest => {\n      drop_own move rest\n      yield \"fallback\"\n    }\n  }\n  yield Ok(label)\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 7\n  yield route(Ok(own n), false, Err(\"guard exit\"))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-inner-none-guard-return-crosses-outer-ok"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn empty() -> Opt[Own[i64]] = None\n\nfn finish(r: Res[Own[i64], Str], stop: Bool) -> Str = match move r {\n  Ok(outer) if {\n    yield match empty() {\n      None if {\n        if stop {\n          return \"escaped\" // @primary nested-guard-return\n        }\n        yield true\n      } => true,\n      None => false,\n      Some(inner) => {\n        drop_own move inner\n        yield false\n      }\n    }\n  } => {\n    drop_own move outer\n    yield \"selected\"\n  },\n  rest => {\n    drop_own move rest\n    yield \"fallback\"\n  }\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 7\n  yield Ok(finish(Ok(own n), true))\n}\n"
       }
     },
     {
@@ -15997,6 +16087,24 @@
       "source": {
         "kind": "utf8",
         "text": "import std::test::abort!\n\nfn consume_or_abort!(root: Own[i64], consume: Bool) -> Unit {\n  if consume {\n    drop_own move root\n  } else {\n    abort!(\"RUNTIME_ABORT\", \"not executed\")\n  }\n}\n\nfn main!() -> Res[Str, Str] = Ok(\"x\")\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-none-guard-return-precedes-whole-binding"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "import std::test::emit!\n\nfn finish(v: Opt[Own[i64]], stop: Bool) -> Str = match move v {\n  whole @ None if {\n    if stop { return \"before selection\" }\n    yield true\n  } => {\n    drop_own move whole\n    yield \"selected\"\n  },\n  rest => {\n    drop_own move rest\n    yield \"fallback\"\n  }\n}\n\nfn main!() -> Res[Str, Str] {\n  emit!(finish(None, false))\n  yield Ok(finish(None, true))\n}\n"
       }
     },
     {
@@ -16423,6 +16531,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-selected-none-whole-must-discharge-on-return"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn finish(v: Opt[Own[i64]], take: Bool) -> Str = match move v {\n  whole @ None if take => {\n    return \"selected\" // @primary selected-whole-return\n  },\n  rest => {\n    drop_own move rest\n    yield \"fallback\"\n  }\n}\n\nfn main!() -> Res[Str, Str] = Ok(finish(None, true))\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-sequence-elements-cannot-be-ownership-roots"
       },
       "public_examples": [],
@@ -16483,6 +16609,24 @@
       "source": {
         "kind": "utf8",
         "text": "fn bad_tuple(x: (Own[i64], i64)) -> i64 {\n  return 0\n}\n\nfn main!() -> Res[Str, Str] {\n  yield Ok(\"x\")\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-unconditional-ok-allows-catch-all-question"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn route(r: Res[Own[i64], Str], gate: Res[Bool, Str]) -> Res[Str, Str] = result {\n  let label: Str = match move r {\n    Ok(root) => {\n      drop_own move root\n      yield \"first\"\n    },\n    whole if gate? => {\n      drop_own move whole\n      yield \"second\"\n    },\n    rest => {\n      drop_own move rest\n      yield \"fallback\"\n    }\n  }\n  yield Ok(label)\n}\n\nfn main!() -> Res[Str, Str] = route(Err(\"input error\"), Err(\"guard exit\"))\n"
       }
     },
     {
@@ -39983,6 +40127,6 @@
       }
     }
   ],
-  "input_digest": "sha256:5f47612e9ada8545eeae23f29a7515bbe8885e176606db108fb01260ea395f28",
+  "input_digest": "sha256:6c6c105412ba5ccbff2d71ef05b44087d0e3c46dd5c79e56f398f6ac32719622",
   "schema_version": "0.1"
 }

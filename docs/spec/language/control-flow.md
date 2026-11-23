@@ -248,7 +248,9 @@ When ownership surface is enabled, `match` ownership-path analysis MUST addition
 
 1. guard-true and guard-false path splits are distinct typed paths for ownership accounting,
 2. typed exits from selected arm expressions are included in ownership discharge analysis,
-3. function-level typed exits through every arm are included.
+3. function-level typed exits through every arm are included,
+4. a typed exit that leaves a consuming match during guard evaluation follows
+   [Conditional Root Carriers](ownership-boundary.md#conditional-root-carriers).
 
 Patterns do not consume ownership by themselves in v0.1.
 An ownership-bearing scrutinee must be transferred before decomposition: use `match move r { ... }` for a named conditional root.
