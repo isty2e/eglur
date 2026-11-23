@@ -1,7 +1,7 @@
 use super::{diagnostic_codes, session};
 use eglur_diagnostics::DiagnosticSnapshot;
 use eglur_driver::{SupportProfile, TrustedCatalog};
-use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct, SemanticLocation};
+use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct};
 
 pub(super) fn checked(source: &str, expected: &[&str]) -> DiagnosticSnapshot {
     let mut session = session(source);
@@ -297,20 +297,7 @@ fn an_outer_move_in_a_guard_is_not_assumed_to_roll_back_on_false() {
         "  None => { drop_own move root\nyield 3 }\n}\n",
         "fn main!() -> Unit { let n: i64 = 1\n_ = check(Some(1), own n) }\n",
     );
-    let mut session = session(source);
-    let catalog = TrustedCatalog::first_slice().unwrap();
-    let analysis = session
-        .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
-        .unwrap();
-    let missing = analysis
-        .trace()
-        .missing()
-        .map(|entry| entry.capability().stable_key())
-        .collect::<Vec<_>>();
-    assert_eq!(missing, ["typecheck.complete_ownership_flow"]);
-    let sealed = session.seal(None).unwrap();
-    assert!(sealed.checked_program().is_none());
-    assert!(diagnostic_codes(sealed.diagnostics()).is_empty());
+    checked(source, &[]);
 }
 
 #[test]
@@ -327,7 +314,7 @@ fn the_selected_arm_sees_its_own_guards_consumption() {
 }
 
 #[test]
-fn checked_sibling_is_retained_when_guard_fallthrough_changes_an_outer_root() {
+fn ordinary_and_consuming_matches_both_keep_their_false_edge() {
     let source = concat!(
         "fn ordinary(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
         "  None => { drop_own move root\nyield 0 },\n",
@@ -339,45 +326,5 @@ fn checked_sibling_is_retained_when_guard_fallthrough_changes_an_outer_root() {
         "  None => { drop_own move outer\nyield 2 }\n",
         "}\n",
     );
-    let mut session = session(source);
-    let catalog = TrustedCatalog::first_slice().unwrap();
-    let analysis = session
-        .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
-        .unwrap();
-    let resolution = analysis.resolution().unwrap();
-    let PhaseProduct::Performed(facts) = resolution.ownership_facts() else {
-        panic!("partial ownership facts must be retained");
-    };
-    assert!(!facts.is_complete());
-    let mut guarded_location = None;
-    for module in resolution.declarations().modules() {
-        for declaration in module
-            .declarations()
-            .filter(|d| d.kind() == DeclarationKind::Function)
-        {
-            let name = declaration.name().unwrap().spelling();
-            let status = if name == "guarded" {
-                guarded_location = Some(SemanticLocation::origin(
-                    module.file(),
-                    declaration.origin(),
-                ));
-                OwnershipBodyStatus::Unperformed
-            } else {
-                assert_eq!(name, "ordinary");
-                OwnershipBodyStatus::Checked
-            };
-            assert!(
-                matches!(facts.body(declaration.id()), FactState::Known(body) if body.status() == status),
-                "{name}"
-            );
-        }
-    }
-    let missing = analysis.trace().missing().collect::<Vec<_>>();
-    assert_eq!(missing.len(), 1);
-    assert_eq!(
-        missing[0].capability().stable_key(),
-        "typecheck.complete_ownership_flow"
-    );
-    assert_eq!(missing[0].locations(), [guarded_location.unwrap()]);
-    assert!(diagnostic_codes(&session.into_diagnostics(None)).is_empty());
+    checked(source, &[]);
 }

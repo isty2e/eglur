@@ -135,8 +135,13 @@ impl TypedOwnershipOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MatchArmControl {
     pub(super) entry: NormalContinuation,
+    pub(crate) constructors: Option<ConstructorSet>,
     pub(super) carrier: Option<CarrierArm>,
 }
+
+/// Whole constructors admitted at an ordered arm, in the scrutinee domain's order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConstructorSet(pub(crate) [bool; 2]);
 
 #[derive(Default)]
 pub(crate) struct RejectedMatchCoverage(BTreeMap<DefId, BTreeMap<ExprId, Poison>>);
@@ -601,6 +606,12 @@ impl BodyTypes {
             return None;
         };
         self.match_arms.get(owner)?.get(*arm).copied()
+    }
+
+    pub(crate) fn has_whole_constructor_entries(&self, owner: ExpressionKey) -> bool {
+        self.match_arms
+            .get(&owner)
+            .is_some_and(|arms| arms.iter().all(|arm| arm.constructors.is_some()))
     }
 
     pub fn ownership_operations(

@@ -23,6 +23,9 @@ mod exit_regions;
 #[path = "ownership/carrier_guards.rs"]
 mod carrier_guards;
 
+#[path = "ownership/ordered_guards.rs"]
+mod ordered_guards;
+
 #[path = "ownership/coverage.rs"]
 mod coverage;
 
