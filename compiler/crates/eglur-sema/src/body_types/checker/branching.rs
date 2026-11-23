@@ -2,6 +2,7 @@ use super::*;
 
 mod search;
 use search::ArmSearch;
+pub(super) use search::Coverage;
 pub(super) use search::MatchDomain;
 
 #[cfg(test)]
@@ -459,52 +460,67 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 frame,
             });
         }
-        if !frame.poison.has_poison() && !frame.unperformed && !frame.deferred {
-            // Coverage is a prerequisite only after the written arms have checked.
-            if frame
-                .search
-                .as_ref()
-                .is_none_or(|search| search.domain.carrier)
-            {
-                let origin = self.pattern_origin(source, frame.expression.arms[0].pattern)?;
-                if !self.recorder.require(
-                    CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
-                    SemanticLocation::origin(source.file(), origin),
-                ) {
-                    return Ok(BranchPlan::Complete(Outcome::Unperformed));
-                }
-            }
-            let Some(search) = &frame.search else {
+        let validate = !frame.poison.has_poison() && !frame.unperformed && !frame.deferred;
+        if validate && frame.search.as_ref().is_none_or(|s| s.domain.carrier) {
+            let origin = self.pattern_origin(source, frame.expression.arms[0].pattern)?;
+            if !self.recorder.require(
+                CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
+                SemanticLocation::origin(source.file(), origin),
+            ) {
                 return Ok(BranchPlan::Complete(Outcome::Unperformed));
-            };
-            match self.check_match_coverage(
-                source,
-                &search.domain,
-                &frame.expression.arms,
-                &frame.patterns,
-            )? {
-                Outcome::Known(arms) => {
-                    let facts = frame
-                        .entries
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, entry)| MatchArmControl {
-                            entry,
-                            carrier: arms.as_ref().map(|facts| facts[i]),
-                        })
-                        .collect::<Box<[_]>>();
-                    if let Some(existing) = self.match_arms.get(&frame.owner) {
-                        if *existing != facts {
-                            return Err(DuplicateFact.into());
-                        }
-                    } else {
-                        self.match_arms.insert(frame.owner, facts);
-                    }
-                }
-                Outcome::Poisoned(found) => frame.poison.include(&found)?,
-                Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
-                Outcome::Deferred => frame.deferred = true,
             }
+        }
+        // A nested coverage failure can still need its enclosing pattern and guard bindings.
+        let recovering = self
+            .current_owner
+            .is_some_and(|owner| self.rejected_coverage.body(owner).is_some());
+        if (validate || recovering)
+            && !frame.unperformed
+            && !frame.deferred
+            && frame.patterns.len() == frame.expression.arms.len()
+            && let Some(search) = &frame.search
+        {
+            let checked = search
+                .domain
+                .check_patterns(&frame.expression.arms, &frame.patterns);
+            if validate {
+                match self.validate_match_coverage(
+                    source,
+                    frame.expression.arms[0].pattern,
+                    checked.coverage,
+                )? {
+                    Outcome::Known(()) => {}
+                    Outcome::Poisoned(failure) => {
+                        frame.poison.include(&failure)?;
+                        if let Some(owner) = self.current_owner {
+                            self.rejected_coverage
+                                .record(owner, frame.owner.expression(), failure);
+                        }
+                    }
+                    Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
+                    Outcome::Deferred => frame.deferred = true,
+                }
+            }
+            if !frame.unperformed && !frame.deferred {
+                let facts = frame
+                    .entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, entry)| MatchArmControl {
+                        entry,
+                        carrier: checked.carriers.as_ref().map(|carriers| carriers[i]),
+                    })
+                    .collect::<Box<[_]>>();
+                if let Some(existing) = self.match_arms.get(&frame.owner) {
+                    if *existing != facts {
+                        return Err(DuplicateFact.into());
+                    }
+                } else {
+                    self.match_arms.insert(frame.owner, facts);
+                }
+            }
+        } else if validate {
+            frame.unperformed = true;
         }
         if let Some(poison) = frame.poison.take() {
             return Ok(BranchPlan::Complete(Outcome::Poisoned(poison)));

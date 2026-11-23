@@ -83,6 +83,16 @@ fn subset(roots: &[Poison], mask: usize) -> Poison {
     result
 }
 
+#[test]
+fn equality_uses_root_membership_and_store_identity() {
+    let local = roots(&mut DiagnosticStore::new(), 3);
+    let foreign = roots(&mut DiagnosticStore::new(), 3);
+    let pair = local[0].merge(&local[2]).unwrap();
+    assert!(pair.same_roots(&local[2].merge(&local[0]).unwrap()));
+    assert!(!pair.same_roots(&local[0]));
+    assert!(!pair.same_roots(&subset(&foreign, 0b101)));
+}
+
 fn pending_roots(accumulated: &PoisonAccumulator) -> Vec<usize> {
     match &accumulated.pending {
         PendingRoots::Empty => Vec::new(),

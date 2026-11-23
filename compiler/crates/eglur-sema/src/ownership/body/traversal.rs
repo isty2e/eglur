@@ -48,6 +48,7 @@ struct MatchFrame<'hir> {
     subject: ValueProvenance,
     result: ValueProvenance,
     carrier: Option<OriginId>,
+    search_input_known: bool,
 }
 
 enum ArmBody {
@@ -107,6 +108,7 @@ enum Written {
 }
 
 enum Step<'hir> {
+    FinishCoverage(&'hir Poison, usize),
     Written(Written),
     ResumeAfterWritten(FlowState),
     Expression(ExprId, Option<ControlRegionKey>),
@@ -189,12 +191,25 @@ impl<'hir> BodyAnalyzer<'hir> {
                     flow = ExpressionFlow::default();
                 }
                 Step::Expression(id, region) => {
+                    if let Some(cause) = self.recovery.and_then(|recovery| recovery.sites.get(&id))
+                    {
+                        pending.push(Step::FinishCoverage(cause, self.failures.len()));
+                    }
                     self.schedule_expression(id, region, state, &mut flow, &mut pending)?;
+                }
+                Step::FinishCoverage(cause, before) => {
+                    if self.failures.len() != before {
+                        self.superseded_coverage.push(cause.clone());
+                    }
                 }
                 Step::Statement(id) => {
                     self.schedule_statement(id, &mut flow, &mut pending)?;
                 }
                 Step::FinishExpression(key, origin) => {
+                    if self.poisoned_value(key) {
+                        flow = ExpressionFlow::default();
+                        continue;
+                    }
                     self.check_side_exits(key, origin, state);
                     flow.continuing =
                         !state.has_input() || self.expression_continues(key, flow.continuing);
@@ -309,6 +324,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                         subject,
                         result: ValueProvenance::default(),
                         carrier,
+                        search_input_known: true,
                     }));
                 }
                 Step::MatchNext(mut frame) => {
@@ -318,7 +334,8 @@ impl<'hir> BodyAnalyzer<'hir> {
                             arm,
                         };
                         let control = self.body_types.match_arm(&region);
-                        let enters = control.is_some_and(|control| control.can_enter());
+                        let enters = frame.search_input_known
+                            && control.is_some_and(|control| control.can_enter());
                         if control.is_none() {
                             self.unperformed = true;
                         }
@@ -383,7 +400,13 @@ impl<'hir> BodyAnalyzer<'hir> {
                         };
                     }
                 }
-                Step::MatchGuard(frame, region, arm, carrier_arm) => {
+                Step::MatchGuard(mut frame, region, arm, carrier_arm) => {
+                    if let Some(guard) = &arm.guard
+                        && self.poisoned_value(ExpressionKey::new(self.module, guard.condition))
+                    {
+                        // Without a Boolean there is no established false edge to later arms.
+                        frame.search_input_known = false;
+                    }
                     if let Some(arm) = carrier_arm {
                         if arm.may_select_present() {
                             let held = self.pending_payloads.pop().expect("active carrier guard");
@@ -516,7 +539,9 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::ValuesNext(sequence));
                 }
                 Step::Let(pattern, initializer) => {
-                    if flow.continuing {
+                    if flow.continuing
+                        && !self.poisoned_value(ExpressionKey::new(self.module, initializer))
+                    {
                         self.bind_let_pattern(pattern, initializer, &flow, state)?;
                     }
                     flow.provenance = ValueProvenance::default();
@@ -638,6 +663,10 @@ impl<'hir> BodyAnalyzer<'hir> {
                 }
             }
             ExprKind::TupleProjection { receiver, index } => {
+                if self.poisoned_value(key) {
+                    pending.push(Step::Expression(*receiver, None));
+                    return Ok(());
+                }
                 let projection_receiver = if let Some(binding) = self.expression_local(*receiver)?
                     && self.binding_contains_reference(binding)?
                 {
@@ -663,7 +692,9 @@ impl<'hir> BodyAnalyzer<'hir> {
             }
             ExprKind::Try(operand) => {
                 pending.push(Step::DiscardProvenance);
-                pending.push(Step::RecoverMove(*operand));
+                if !self.poisoned_value(key) {
+                    pending.push(Step::RecoverMove(*operand));
+                }
                 pending.push(Step::Expression(*operand, None));
             }
             ExprKind::Result(inner) | ExprKind::Checked(inner) => {
@@ -682,9 +713,8 @@ impl<'hir> BodyAnalyzer<'hir> {
                 pending.push(Step::Expression(value.condition, None));
             }
             ExprKind::Match(value) => {
-                let subject = self
-                    .body_types
-                    .expression(ExpressionKey::new(self.module, value.scrutinee));
+                let scrutinee = ExpressionKey::new(self.module, value.scrutinee);
+                let subject = self.body_types.expression(scrutinee);
                 if let FactState::Known(typed) = subject
                     && !matches!(
                         self.signatures.types().ownership_root(typed.ty())?,
@@ -694,7 +724,9 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::MatchSubject(key, value));
                     pending.push(Step::Expression(value.scrutinee, None));
                 } else {
-                    self.unperformed = true;
+                    if !self.poisoned_value(scrutinee) {
+                        self.unperformed = true;
+                    }
                     let children = [value.scrutinee]
                         .into_iter()
                         .chain(value.arms.iter().flat_map(|arm| {
@@ -887,6 +919,15 @@ impl<'hir> BodyAnalyzer<'hir> {
         arguments: impl IntoIterator<Item = ExprId>,
         pending: &mut Vec<Step<'hir>>,
     ) -> Result<(), OwnershipAnalysisError> {
+        if self.poisoned_value(key)
+            && !matches!(self.body_types.invocation(key), FactState::Known(_))
+        {
+            pending.push(Step::ValuesNext(ValueSequence::new(
+                callee.into_iter().chain(arguments),
+                ValueSequenceKind::Discard,
+            )));
+            return Ok(());
+        }
         let sequence = ValueSequence::new(
             arguments,
             ValueSequenceKind::Call {

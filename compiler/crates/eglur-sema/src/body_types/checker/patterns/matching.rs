@@ -713,93 +713,33 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         }))
     }
 
-    pub(in super::super) fn check_match_coverage(
+    pub(in super::super) fn validate_match_coverage(
         &mut self,
         source: &SemanticSource<'_>,
-        domain: &branching::MatchDomain,
-        arms: &[eglur_hir::MatchArm],
-        patterns: &[PatternCheck],
-    ) -> Result<Outcome<Option<Vec<CarrierArm>>>, BodyFlow> {
-        assert_eq!(arms.len(), patterns.len(), "all arms passed pattern typing");
-        let impossible = domain.impossible;
-        let universe = domain.constructors.as_ref().map(|roles| roles.each_ref());
-        let mut carrier_arms =
-            (domain.carrier && universe.is_some()).then(|| Vec::with_capacity(arms.len()));
-        let mut total = universe.is_some() && impossible == [true, true];
-        let mut variants = BTreeSet::new();
-        if let Some(roles) = universe {
-            for (role, impossible) in roles.into_iter().zip(impossible) {
-                if impossible {
-                    variants.insert(role.clone());
-                }
+        first: PatternId,
+        coverage: branching::Coverage,
+    ) -> Result<Outcome<()>, BodyFlow> {
+        use branching::Coverage;
+        let (pattern, code, message) = match coverage {
+            Coverage::Exhaustive => return Ok(Outcome::Known(())),
+            Coverage::Unreachable(pattern) => {
+                (pattern, "MATCH_UNREACHABLE_ARM", "match arm is unreachable")
             }
-        }
-
-        for (arm, pattern) in arms.iter().zip(patterns) {
-            let coverage = &pattern.coverage;
-            let unreachable = total
-                || pattern
-                    .partial_variant
-                    .as_ref()
-                    .is_some_and(|variant| variants.contains(variant))
-                || (!coverage.variants.is_empty()
-                    && coverage
-                        .variants
-                        .iter()
-                        .all(|variant| variants.contains(variant)));
-            if unreachable {
-                return self
-                    .type_error(
-                        source,
-                        self.pattern_origin(source, arm.pattern)?,
-                        "MATCH_UNREACHABLE_ARM",
-                        "match arm is unreachable",
-                        BTreeMap::new(),
-                    )
-                    .map(Outcome::Poisoned);
+            Coverage::MissingVariant => (first, "MATCH_NON_EXHAUSTIVE", "match is non-exhaustive"),
+            Coverage::Unknown => {
+                self.demand_unimplemented(
+                    TypecheckCapability::AnalyzePatternCoverage,
+                    source,
+                    self.pattern_origin(source, first)?,
+                );
+                return Ok(Outcome::Unperformed);
             }
-            if let (Some(roles), Some(facts)) = (universe, &mut carrier_arms) {
-                if let Some(fact) = pattern.carrier_arm(roles, &variants) {
-                    facts.push(fact);
-                } else {
-                    carrier_arms = None;
-                }
-            }
-            if arm.guard.is_none() {
-                variants.extend(coverage.variants.iter().cloned());
-                total |= coverage.total
-                    || universe
-                        .is_some_and(|roles| roles.into_iter().all(|v| variants.contains(v)));
-            }
-        }
-        if total {
-            return Ok(Outcome::Known(carrier_arms));
-        }
-        let Some(universe) = universe else {
-            let origin = arms
-                .first()
-                .map(|arm| self.pattern_origin(source, arm.pattern))
-                .transpose()?
-                .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
-            self.demand_unimplemented(TypecheckCapability::AnalyzePatternCoverage, source, origin);
-            return Ok(Outcome::Unperformed);
         };
-        if universe
-            .into_iter()
-            .all(|variant| variants.contains(variant))
-        {
-            return Ok(Outcome::Known(carrier_arms));
-        }
-        let origin = arms
-            .first()
-            .map(|arm| self.pattern_origin(source, arm.pattern))
-            .transpose()?
-            .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
         self.type_error(
             source,
-            origin,
-            "MATCH_NON_EXHAUSTIVE",
-            "match is non-exhaustive",
+            self.pattern_origin(source, pattern)?,
+            code,
+            message,
             BTreeMap::new(),
         )
         .map(Outcome::Poisoned)

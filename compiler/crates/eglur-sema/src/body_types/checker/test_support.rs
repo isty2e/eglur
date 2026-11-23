@@ -111,6 +111,7 @@ pub(super) fn with_checker_owned(
             checked_numeric: FactTable::new(),
             ownership_operations: FactTable::new(),
             match_arms: BTreeMap::new(),
+            rejected_coverage: RejectedMatchCoverage::default(),
             bodies: FactTable::new(),
             transfers: Vec::new(),
             callable_instances: Vec::new(),

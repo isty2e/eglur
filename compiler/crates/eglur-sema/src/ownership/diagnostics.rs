@@ -6,11 +6,12 @@ use eglur_source::{ByteOffset, ByteRange, FileSpan};
 use crate::diagnostic::record_type_error_with_related;
 use crate::{DeclarationCollection, LocalBindingId, NameResolution, SemanticSource};
 
+use super::body::OwnershipFindings;
 use super::model::OwnershipCause;
 use super::{OwnershipAnalysisError, OwnershipFailure, OwnershipFailureKind};
 
-pub(crate) fn emit_ownership_diagnostics(
-    failures: &[OwnershipFailure],
+pub(super) fn emit_ownership_diagnostics(
+    findings: &[OwnershipFindings],
     collection: &DeclarationCollection,
     names: &NameResolution,
     sources: &[SemanticSource<'_>],
@@ -27,32 +28,34 @@ pub(crate) fn emit_ownership_diagnostics(
         .iter()
         .map(|binding| (binding.id(), binding.name().spelling()))
         .collect::<BTreeMap<_, _>>();
-    let mut by_owner = BTreeMap::new();
-    for failure in failures {
-        by_owner
-            .entry(failure.owner())
-            .or_insert_with(Vec::new)
-            .push(resolve_failure(
-                failure,
-                collection,
-                &source_map,
-                &local_names,
-            )?);
-    }
-    for candidates in by_owner.values_mut() {
-        candidates.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
-        let Some(selected) = candidates.first() else {
+    for instance in findings {
+        let mut selected: Option<ResolvedFailure> = None;
+        for failure in &instance.failures {
+            let candidate = resolve_failure(failure, collection, &source_map, &local_names)?;
+            if selected
+                .as_ref()
+                .is_none_or(|previous| candidate.order_key() < previous.order_key())
+            {
+                selected = Some(candidate);
+            }
+        }
+        let Some(selected) = selected else {
             continue;
         };
-        let related = selected.related.clone().into_iter().collect::<Vec<_>>();
-        record_type_error_with_related(
+        let related = selected.related.into_iter().collect::<Vec<_>>();
+        let primary = record_type_error_with_related(
             diagnostics,
             selected.code,
-            selected.message.clone(),
-            selected.span.clone(),
+            selected.message,
+            selected.span,
             related,
             BTreeMap::<Box<str>, DiagnosticDataValue>::new(),
         )?;
+        for later in &instance.superseded_coverage {
+            diagnostics
+                .select_preceding_roots(&primary, later)
+                .map_err(OwnershipAnalysisError::DiagnosticStore)?;
+        }
     }
     Ok(())
 }

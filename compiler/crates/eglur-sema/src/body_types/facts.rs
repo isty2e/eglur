@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use eglur_diagnostics::Poison;
 use eglur_hir::{ExprId, Mutability};
 
 use super::LocalTypeFacts;
@@ -135,6 +136,23 @@ impl TypedOwnershipOperation {
 pub(crate) struct MatchArmControl {
     pub(super) entry: NormalContinuation,
     pub(super) carrier: Option<CarrierArm>,
+}
+
+#[derive(Default)]
+pub(crate) struct RejectedMatchCoverage(BTreeMap<DefId, BTreeMap<ExprId, Poison>>);
+
+impl RejectedMatchCoverage {
+    pub(super) fn record(&mut self, owner: DefId, expression: ExprId, cause: Poison) {
+        self.0.entry(owner).or_default().insert(expression, cause);
+    }
+
+    pub(super) fn withhold_body(&mut self, owner: DefId) {
+        self.0.remove(&owner);
+    }
+
+    pub(crate) fn body(&self, owner: DefId) -> Option<&BTreeMap<ExprId, Poison>> {
+        self.0.get(&owner)
+    }
 }
 
 impl MatchArmControl {
@@ -467,6 +485,7 @@ pub struct BodyTypes {
     pub(super) checked_numeric: FactTable<ExpressionKey, CheckedNumericOperation>,
     pub(super) ownership_operations: FactTable<ExpressionKey, TypedOwnershipOperation>,
     pub(super) match_arms: BTreeMap<ExpressionKey, Box<[MatchArmControl]>>,
+    pub(crate) rejected_coverage: RejectedMatchCoverage,
     pub(super) bodies: FactTable<DefId, BodyTypeSummary>,
     pub(super) transfers: Box<[ControlTransfer]>,
     pub(super) callable_instances: Box<[CallableInstance]>,

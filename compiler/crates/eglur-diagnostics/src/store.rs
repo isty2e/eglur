@@ -80,6 +80,12 @@ impl Poison {
         self.snapshot.roots()
     }
 
+    /// Whether both values trace to exactly the same failures in the same store.
+    pub fn same_roots(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.store, &other.store)
+            && (self.snapshot.same_snapshot(&other.snapshot) || self.roots() == other.roots())
+    }
+
     fn contains_root(&self, root: &usize) -> bool {
         self.roots()
             .binary_search_by(|candidate| {

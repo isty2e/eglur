@@ -14,7 +14,8 @@ use crate::{
     TypecheckCapability,
 };
 
-use super::{OwnershipFacts, OwnershipFailure, analyze_body, emit_ownership_diagnostics};
+use super::body::{CoverageRecovery, OwnershipFindings};
+use super::{OwnershipFacts, analyze_body, emit_ownership_diagnostics};
 
 /// Performs the bounded ownership phase and emits at most one ownership error per callable.
 #[allow(
@@ -75,7 +76,7 @@ fn build_ownership_facts(
     sources: &[SemanticSource<'_>],
     signatures: &DeclarationSignatures,
     body_types: &BodyTypes,
-) -> Result<(OwnershipFacts, Box<[OwnershipFailure]>), OwnershipAnalysisError> {
+) -> Result<(OwnershipFacts, Vec<OwnershipFindings>), OwnershipAnalysisError> {
     let mut source_map = BTreeMap::new();
     for source in sources {
         if source_map.insert(source.file(), source).is_some() {
@@ -119,25 +120,29 @@ fn build_ownership_facts(
         if signature.body().is_none() {
             continue;
         }
-        match body_types.body(declaration.id()) {
-            FactState::Known(_) => {}
-            FactState::Poisoned(poison) => {
+        let rejected_matches = body_types.rejected_coverage.body(declaration.id());
+        let recovery = match (body_types.body(declaration.id()), rejected_matches) {
+            (FactState::Known(_), _) => None,
+            (FactState::Poisoned(poison), Some(sites)) => {
+                Some(CoverageRecovery::new(poison, sites)?)
+            }
+            (FactState::Poisoned(poison), None) => {
                 facts
                     .bodies
                     .insert(declaration.id(), SemanticFact::Poisoned(poison.clone()))?;
                 continue;
             }
-            FactState::Unperformed => {
+            (FactState::Unperformed, _) => {
                 facts.complete = false;
                 continue;
             }
-            FactState::NotApplicable => {
+            (FactState::NotApplicable, _) => {
                 facts
                     .bodies
                     .insert(declaration.id(), SemanticFact::NotApplicable)?;
                 continue;
             }
-        }
+        };
 
         let module = collection.module(declaration.id().module()).ok_or(
             OwnershipAnalysisError::UnknownModule(declaration.id().module()),
@@ -174,15 +179,17 @@ fn build_ownership_facts(
             names,
             signatures,
             body_types,
+            recovery,
         )?;
-        facts.complete &= analysis.summary.status() == super::OwnershipBodyStatus::Checked;
-        failures.extend(analysis.failures);
-        facts
-            .bodies
-            .insert(declaration.id(), SemanticFact::Known(analysis.summary))?;
+        if !analysis.findings.failures.is_empty() {
+            failures.push(analysis.findings);
+        }
+        if let SemanticFact::Known(summary) = &analysis.fact {
+            facts.complete &= summary.status() == super::OwnershipBodyStatus::Checked;
+        }
+        facts.bodies.insert(declaration.id(), analysis.fact)?;
     }
-    failures.sort_by_key(|failure| (failure.owner(), failure.origin()));
-    Ok((facts, failures.into_boxed_slice()))
+    Ok((facts, failures))
 }
 
 fn parameter_bindings(

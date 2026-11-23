@@ -13,8 +13,8 @@ use crate::body_types::CarrierArm;
 use crate::{
     BodyTypes, ControlRegionKey, ControlTransfer, ControlTransferSource, DeclarationSignatures,
     DefId, ExpressionKey, FactState, IfBranch, LocalBindingId, ModuleId, NameResolution,
-    NormalContinuation, ReduceByCommitment, ResolutionKey, ResolvedName, StatementKey, TypeKind,
-    TypedOwnershipOperationKind, TypedPlaceKind,
+    NormalContinuation, ReduceByCommitment, ResolutionKey, ResolvedName, SemanticFact,
+    StatementKey, TypeKind, TypedOwnershipOperationKind, TypedPlaceKind,
 };
 
 use super::analysis::OwnershipAnalysisError;
@@ -24,10 +24,54 @@ use super::{
     OwnershipFailureKind, OwnershipRootFact,
 };
 use branches::{Alternatives, FlowState, RecoverableExits};
+use eglur_diagnostics::{Poison, PoisonAccumulator};
 
-pub(crate) struct OwnershipBodyAnalysis {
-    pub(crate) summary: OwnershipBodySummary,
-    pub(crate) failures: Vec<OwnershipFailure>,
+pub(super) struct OwnershipBodyAnalysis {
+    pub(super) fact: SemanticFact<OwnershipBodySummary>,
+    pub(super) findings: OwnershipFindings,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CoverageRecovery<'a> {
+    cause: &'a Poison,
+    sites: &'a BTreeMap<ExprId, Poison>,
+    extent: RecoveryExtent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryExtent {
+    Body,
+    WrittenMatches,
+}
+
+impl<'a> CoverageRecovery<'a> {
+    pub(super) fn new(
+        cause: &'a Poison,
+        sites: &'a BTreeMap<ExprId, Poison>,
+    ) -> Result<Self, OwnershipAnalysisError> {
+        let mut coverage = PoisonAccumulator::default();
+        for site in sites.values() {
+            coverage
+                .include(site)
+                .map_err(OwnershipAnalysisError::DiagnosticStore)?;
+        }
+        let extent = if coverage.finish().is_some_and(|all| all.same_roots(cause)) {
+            RecoveryExtent::Body
+        } else {
+            RecoveryExtent::WrittenMatches
+        };
+        Ok(Self {
+            cause,
+            sites,
+            extent,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct OwnershipFindings {
+    pub(super) failures: Vec<OwnershipFailure>,
+    pub(super) superseded_coverage: Vec<Poison>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,7 +193,7 @@ impl ExpressionFlow {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn analyze_body(
+pub(super) fn analyze_body(
     owner: DefId,
     module: ModuleId,
     body: &Body,
@@ -158,6 +202,7 @@ pub(crate) fn analyze_body(
     names: &NameResolution,
     signatures: &DeclarationSignatures,
     body_types: &BodyTypes,
+    recovery: Option<CoverageRecovery<'_>>,
 ) -> Result<OwnershipBodyAnalysis, OwnershipAnalysisError> {
     let mut analyzer = BodyAnalyzer {
         owner,
@@ -166,6 +211,8 @@ pub(crate) fn analyze_body(
         names,
         signatures,
         body_types,
+        recovery,
+        superseded_coverage: Vec::new(),
         roots: BTreeMap::new(),
         locals_by_region: BTreeMap::new(),
         failures: Vec::new(),
@@ -175,34 +222,31 @@ pub(crate) fn analyze_body(
         tentative: BTreeSet::new(),
         pending_payloads: Vec::new(),
     };
-    let mut state = FlowState::default();
-    for parameter in parameters {
-        analyzer.introduce_root(parameter, &mut state)?;
-    }
-    let flow =
-        analyzer.visit_expression(root, &mut state, Some(ControlRegionKey::Callable(owner)))?;
-    if !matches!(
-        body.expression(root).map(eglur_hir::Expr::kind),
-        Some(ExprKind::Block { .. })
-    ) {
-        analyzer.recover_missing_move(root, &mut state)?;
-    }
-    if flow.continuing
-        && !matches!(
-            body.expression(root).map(eglur_hir::Expr::kind),
-            Some(ExprKind::Block { .. })
-        )
+    if let Some(CoverageRecovery {
+        extent: RecoveryExtent::WrittenMatches,
+        sites,
+        ..
+    }) = recovery
     {
-        let origin = body
-            .expression(root)
-            .ok_or(OwnershipAnalysisError::WrongBodyExpression(root))?
-            .origin();
-        analyzer.check_transfer_source(
-            &ControlTransferSource::RegionCompletion(ControlRegionKey::Callable(owner)),
-            origin,
-            false,
-            &mut state,
-        );
+        // Other ill-typed expressions cannot establish the state entering these matches.
+        for &site in sites.keys() {
+            analyzer.visit_expression(site, &mut FlowState::written_only(), None)?;
+        }
+    } else {
+        analyzer.visit_callable(root, parameters)?;
+    }
+    if let Some(recovery) = recovery {
+        return Ok(OwnershipBodyAnalysis {
+            fact: SemanticFact::Poisoned(recovery.cause.clone()),
+            findings: if analyzer.unperformed {
+                OwnershipFindings::default()
+            } else {
+                OwnershipFindings {
+                    failures: analyzer.failures,
+                    superseded_coverage: analyzer.superseded_coverage,
+                }
+            },
+        });
     }
     let ownership_local_exists = body.patterns().try_fold(
         false,
@@ -259,7 +303,7 @@ pub(crate) fn analyze_body(
         .into_iter()
         .map(|(binding, region)| OwnershipRootFact::new(binding, region));
     Ok(OwnershipBodyAnalysis {
-        summary: OwnershipBodySummary::new(
+        fact: SemanticFact::Known(OwnershipBodySummary::new(
             if unperformed {
                 OwnershipBodyStatus::Unperformed
             } else {
@@ -267,11 +311,14 @@ pub(crate) fn analyze_body(
             },
             roots,
             analyzer.operation_count,
-        ),
-        failures: if unperformed {
-            Vec::new()
+        )),
+        findings: if unperformed {
+            OwnershipFindings::default()
         } else {
-            analyzer.failures
+            OwnershipFindings {
+                failures: analyzer.failures,
+                superseded_coverage: analyzer.superseded_coverage,
+            }
         },
     })
 }
@@ -283,6 +330,8 @@ struct BodyAnalyzer<'analysis> {
     names: &'analysis NameResolution,
     signatures: &'analysis DeclarationSignatures,
     body_types: &'analysis BodyTypes,
+    recovery: Option<CoverageRecovery<'analysis>>,
+    superseded_coverage: Vec<Poison>,
     roots: BTreeMap<LocalBindingId, ControlRegionKey>,
     locals_by_region: BTreeMap<ControlRegionKey, BTreeSet<LocalBindingId>>,
     failures: Vec<OwnershipFailure>,
@@ -294,6 +343,39 @@ struct BodyAnalyzer<'analysis> {
 }
 
 impl BodyAnalyzer<'_> {
+    fn visit_callable(
+        &mut self,
+        root: ExprId,
+        parameters: BTreeSet<LocalBindingId>,
+    ) -> Result<(), OwnershipAnalysisError> {
+        let mut state = FlowState::default();
+        for parameter in parameters {
+            self.introduce_root(parameter, &mut state)?;
+        }
+        let region = ControlRegionKey::Callable(self.owner);
+        let flow = self.visit_expression(root, &mut state, Some(region.clone()))?;
+        let expression = self
+            .body
+            .expression(root)
+            .ok_or(OwnershipAnalysisError::WrongBodyExpression(root))?;
+        if !matches!(expression.kind(), ExprKind::Block { .. }) {
+            self.recover_missing_move(root, &mut state)?;
+            if flow.continuing {
+                self.check_transfer_source(
+                    &ControlTransferSource::RegionCompletion(region),
+                    expression.origin(),
+                    false,
+                    &mut state,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn poisoned_value(&self, key: ExpressionKey) -> bool {
+        self.recovery.is_some() && matches!(self.body_types.expression(key), FactState::Poisoned(_))
+    }
+
     fn visit_ownership_operation(
         &mut self,
         key: ExpressionKey,
@@ -301,6 +383,9 @@ impl BodyAnalyzer<'_> {
         state: &mut FlowState,
     ) -> Result<ExpressionFlow, OwnershipAnalysisError> {
         let FactState::Known(operation) = self.body_types.ownership_operation(key) else {
+            if self.poisoned_value(key) {
+                return Ok(ExpressionFlow::default());
+            }
             return Err(OwnershipAnalysisError::MissingExpressionType(key));
         };
         self.operation_count += 1;
@@ -605,8 +690,17 @@ impl BodyAnalyzer<'_> {
         expression: ExprId,
         state: &mut FlowState,
     ) -> Result<(), OwnershipAnalysisError> {
+        if self
+            .recovery
+            .is_some_and(|recovery| recovery.extent == RecoveryExtent::WrittenMatches)
+        {
+            return Ok(());
+        }
         let mut pending = vec![expression];
         while let Some(id) = pending.pop() {
+            if self.poisoned_value(ExpressionKey::new(self.module, id)) {
+                continue;
+            }
             let expression = self
                 .body
                 .expression(id)
