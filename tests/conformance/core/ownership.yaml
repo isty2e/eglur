@@ -234,6 +234,31 @@ tests:
     value:
       kind: Ok
       repr: '"ok"'
+- id: OWN-consuming-result-match-discharges-ok-and-retains-err-value
+  category: ownership
+  title: consuming a result discharges its Ok payload and preserves its Err value
+  code: |
+    import std::test::emit!
+
+    fn finish(v: Res[Own[i64], Str]) -> Str = match move v {
+      Ok(root) => {
+        drop_own move root
+        yield "released"
+      },
+      Err(reason) => reason
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(finish(Ok(own n)))
+      yield Ok(finish(Err("not opened")))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"not opened"'
+    side_effects:
+    - released
 - id: OWN-move-free-match-arms-still-participate-in-global-ownership-discharge
   category: ownership
   title: move-free match arms still participate in function-region discharge
@@ -1544,6 +1569,8 @@ tests:
   category: ownership
   title: guard false preserves moved carrier payload for later arm
   code: |
+    import std::test::emit!
+
     fn consume_guarded(v: Opt[Own[i64]], first: Bool) -> i64 {
       match move v {
         Some(x) if first => {
@@ -1561,12 +1588,22 @@ tests:
     }
 
     fn main!() -> Res[Str, Str] {
-      yield Ok("ok")
+      let a: i64 = 7
+      let b: i64 = 8
+      let first = consume_guarded(Some(own a), true)
+      let fallback = consume_guarded(Some(own b), false)
+      let empty = consume_guarded(None, false)
+      emit!(to_str(first))
+      emit!(to_str(fallback))
+      yield Ok(to_str(empty))
     }
   expect:
     value:
       kind: Ok
-      repr: '"ok"'
+      repr: '"0"'
+    side_effects:
+    - '1'
+    - '2'
 - id: OWN-guard-may-shared-borrow-tentative-root
   category: ownership
   title: guard may shared-borrow tentative root
