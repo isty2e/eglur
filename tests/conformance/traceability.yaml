@@ -24,13 +24,13 @@ policy:
     - code: EXTERN_LINKAGE_FAILED
       precondition: ffi_linkage_probe
 summary:
-  required_code_count: 275
-  baseline_scope_code_count: 270
-  asserted_code_count: 266
+  required_code_count: 276
+  baseline_scope_code_count: 271
+  asserted_code_count: 267
   mentioned_only_code_count: 0
   uncovered_code_count: 9
-  hard_required_code_count: 264
-  hard_required_asserted_count: 264
+  hard_required_code_count: 265
+  hard_required_asserted_count: 265
   hard_required_gap_count: 0
   conditional_required_code_count: 2
   conditional_required_asserted_count: 2
@@ -1622,7 +1622,7 @@ coverage:
     asserted_in:
       - id: core-ownership
         file: core/ownership.yaml
-        test_ids: [OWN-discard-target-cannot-consume-root-even-with-move, OWN-overwriting-root-is-forbidden, OWN-unused-fresh-root-expression-is-forbidden]
+        test_ids: [OWN-discard-target-cannot-consume-root-even-with-move, OWN-match-cannot-discard-an-unnamed-present-payload, OWN-overwriting-root-is-forbidden, OWN-unused-fresh-root-expression-is-forbidden]
     mentioned_only_in: []
   - code: OWNERSHIP_DOUBLE_MOVE
     severity: error
@@ -2091,6 +2091,15 @@ coverage:
       - id: core-conditionals
         file: core/conditionals.yaml
         test_ids: [CFL-named-variant-pattern-without-rest-rejects-missing-field, CFL-pathless-struct-missing-field-blames-opening-pattern-brace, CFL-struct-pattern-without-rest-rejects-missing-field]
+    mentioned_only_in: []
+  - code: PATTERN_OWNERSHIP_BINDING_OVERLAP
+    severity: error
+    policy: hard_required_asserted
+    status: asserted
+    asserted_in:
+      - id: core-ownership
+        file: core/ownership.yaml
+        test_ids: [OWN-option-pattern-cannot-bind-both-carrier-and-payload, OWN-result-pattern-cannot-bind-both-carrier-and-payload]
     mentioned_only_in: []
   - code: PATTERN_PAYLOAD_FORM_MISMATCH
     severity: error

@@ -3499,6 +3499,22 @@ codes:
       - field
       conditional_required: []
       exact_value_keys: []
+  PATTERN_OWNERSHIP_BINDING_OVERLAP:
+    severity: error
+    message:
+      all_of:
+      - pattern
+      - ownership
+      - binding
+      - overlap
+      any_of: []
+      templates: []
+      contextual: []
+    data:
+      required: []
+      required_if_emitted: []
+      conditional_required: []
+      exact_value_keys: []
   PATTERN_PAYLOAD_FORM_MISMATCH:
     severity: error
     message:

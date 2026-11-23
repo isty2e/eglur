@@ -494,12 +494,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         context: BodyContext<'_, '_>,
         mut frame: Box<MatchFrame>,
     ) -> Result<BranchPlan, BodyFlow> {
-        let BodyContext {
-            module,
-            source,
-            body,
-            ..
-        } = context;
+        let BodyContext { module, body, .. } = context;
         let arm = &frame.expression.arms[frame.next_arm];
         let pattern = if let Some(expected) = frame.scrutinee_type {
             self.type_match_pattern(context, arm.pattern, expected)?
@@ -508,25 +503,8 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         };
         match pattern {
             Outcome::Known(pattern) => {
-                if let Some((name, duplicate_origin)) =
-                    self.match_pattern_duplicate(module, body, arm.pattern)?
-                {
-                    let found = self.type_error(
-                        source,
-                        duplicate_origin,
-                        "PATTERN_DUPLICATE_BINDING",
-                        format!("pattern binding `{}` is duplicated", name.spelling()),
-                        BTreeMap::from([(
-                            Box::<str>::from("name"),
-                            DiagnosticDataValue::from(name.spelling()),
-                        )]),
-                    )?;
-                    self.bind_pattern_poison(module, body, arm.pattern, found.clone())?;
-                    frame.poison.include(&found)?;
-                } else {
-                    self.install_match_bindings(module, arm.pattern)?;
-                    frame.coverage.push((frame.next_arm, pattern.coverage));
-                }
+                self.install_match_bindings(module, arm.pattern)?;
+                frame.coverage.push((frame.next_arm, pattern.coverage));
             }
             Outcome::Poisoned(found) => {
                 self.bind_pattern_poison(module, body, arm.pattern, found.clone())?;

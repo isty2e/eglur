@@ -259,6 +259,109 @@ tests:
       repr: '"not opened"'
     side_effects:
     - released
+- id: OWN-option-pattern-cannot-bind-both-carrier-and-payload
+  category: ownership
+  title: an unused owning binding still overlaps before the guard
+  code: |
+    fn consume(v: Opt[Own[i64]]) -> i64 = match move v {
+      whole @ Some(x) if false => { drop_own move x
+                                    yield 1 },
+      rest => { drop_own move rest
+                yield 0 }
+    }
+
+    fn main!() -> Res[Str, Str] = Ok("unused")
+  expect:
+    compile_error:
+      code: PATTERN_OWNERSHIP_BINDING_OVERLAP
+      message_contains:
+      - pattern
+      - binding
+      - ownership
+      - overlap
+      data_keys: []
+- id: OWN-result-pattern-cannot-bind-both-carrier-and-payload
+  category: ownership
+  title: binding the Ok carrier and its owned payload overlaps
+  code: |
+    fn consume(v: Res[Own[i64], Str]) -> i64 = match move v {
+      whole @ Ok(x) => { drop_own move whole
+                         yield 1 },
+      Err(_) => 0
+    }
+
+    fn main!() -> Res[Str, Str] = Ok("unused")
+  expect:
+    compile_error:
+      code: PATTERN_OWNERSHIP_BINDING_OVERLAP
+      message_contains:
+      - pattern
+      - binding
+      - ownership
+      - overlap
+      data_keys: []
+- id: OWN-match-may-keep-the-whole-carrier
+  category: ownership
+  title: a whole-carrier binding covers an unnamed owned payload
+  code: |
+    import std::test::emit!
+
+    fn release(v: Opt[Own[i64]]) -> i64 = match move v {
+      whole @ Some(_) => {
+        drop_own move whole
+        yield 1
+      },
+      empty @ None => {
+        drop_own move empty
+        yield 0
+      }
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(to_str(release(Some(own n))))
+      yield Ok(to_str(release(None)))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"0"'
+    side_effects:
+    - '1'
+- id: OWN-carrier-binding-is-independent-across-or-alternatives
+  category: ownership
+  title: exclusive alternatives may each bind the whole carrier once
+  code: |
+    fn release(r: Res[Own[i64], Str]) -> i64 = match move r {
+      (whole @ Ok(_)) | (whole @ Err(_)) => {
+        drop_own move whole
+        yield 1
+      }
+    }
+
+    fn main!() -> Res[Str, Str] = Ok(to_str(release(Err("empty"))))
+  expect:
+    value:
+      kind: Ok
+      repr: '"1"'
+- id: OWN-match-cannot-discard-an-unnamed-present-payload
+  category: ownership
+  title: a selected Some wildcard drops a present payload without a binding
+  code: |
+    fn lose(v: Opt[Own[i64]]) -> i64 = match move v {
+      Some(_) => 1,
+      None => 0
+    }
+
+    fn main!() -> Res[Str, Str] = Ok("unused")
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
 - id: OWN-move-free-match-arms-still-participate-in-global-ownership-discharge
   category: ownership
   title: move-free match arms still participate in function-region discharge

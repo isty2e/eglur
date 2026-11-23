@@ -15217,6 +15217,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-carrier-binding-is-independent-across-or-alternatives"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn release(r: Res[Own[i64], Str]) -> i64 = match move r {\n  (whole @ Ok(_)) | (whole @ Err(_)) => {\n    drop_own move whole\n    yield 1\n  }\n}\n\nfn main!() -> Res[Str, Str] = Ok(to_str(release(Err(\"empty\"))))\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-checked-region-root-must-discharge-before-fault-edge"
       },
       "public_examples": [],
@@ -15703,6 +15721,42 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-match-cannot-discard-an-unnamed-present-payload"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn lose(v: Opt[Own[i64]]) -> i64 = match move v {\n  Some(_) => 1,\n  None => 0\n}\n\nfn main!() -> Res[Str, Str] = Ok(\"unused\")\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-match-may-keep-the-whole-carrier"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "import std::test::emit!\n\nfn release(v: Opt[Own[i64]]) -> i64 = match move v {\n  whole @ Some(_) => {\n    drop_own move whole\n    yield 1\n  },\n  empty @ None => {\n    drop_own move empty\n    yield 0\n  }\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 3\n  emit!(to_str(release(Some(own n))))\n  yield Ok(to_str(release(None)))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-maybe-consumed-root-is-unbalanced-at-region-exit"
       },
       "public_examples": [],
@@ -15973,6 +16027,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-option-pattern-cannot-bind-both-carrier-and-payload"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn consume(v: Opt[Own[i64]]) -> i64 = match move v {\n  whole @ Some(x) if false => { drop_own move x\n                                yield 1 },\n  rest => { drop_own move rest\n            yield 0 }\n}\n\nfn main!() -> Res[Str, Str] = Ok(\"unused\")\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-ordinary-generic-cannot-be-instantiated-with-root-type"
       },
       "public_examples": [],
@@ -16213,6 +16285,24 @@
       "source": {
         "kind": "utf8",
         "text": "fn bad_error(r: Res[i64, Own[Str]]) -> i64 {\n  return 0\n}\n\nfn main!() -> Res[Str, Str] {\n  yield Ok(\"x\")\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-result-pattern-cannot-bind-both-carrier-and-payload"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn consume(v: Res[Own[i64], Str]) -> i64 = match move v {\n  whole @ Ok(x) => { drop_own move whole\n                     yield 1 },\n  Err(_) => 0\n}\n\nfn main!() -> Res[Str, Str] = Ok(\"unused\")\n"
       }
     },
     {
@@ -39839,6 +39929,6 @@
       }
     }
   ],
-  "input_digest": "sha256:d60beab842bf7492a6f78e222be7ad60ffcd224a14272d823158f0aa2a7998d9",
+  "input_digest": "sha256:9e661dd2bf60c88d7aec7006668348370ef5134ca8d428cf609bcaad6f4a1663",
   "schema_version": "0.1"
 }

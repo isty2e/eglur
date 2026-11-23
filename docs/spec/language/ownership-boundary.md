@@ -138,11 +138,23 @@ Rules:
 7. On `None`/`Err`, `?` consumes the carrier and performs the ordinary typed early exit; no direct root is created.
 8. Consuming pattern extraction requires `match move r { ... }` for a named carrier.
 9. A successful `Some(x)` or `Ok(x)` binding in Rule 8 introduces `x` as a direct ownership root in the selected arm; that arm MUST discharge or transfer `x` before an edge exits the arm's obligation region.
+   1. Each complete pattern alternative for a conditional root, named or fresh,
+      MUST bind its ownership at most once (`PATTERN_OWNERSHIP_BINDING_OVERLAP`
+      otherwise). Both `whole @ Some(x)` and `Some(x @ y)` bind it twice. The
+      rule applies before the guard, even if the arm never uses one of the names.
+   2. A pattern may bind just the carrier (`whole @ Some(_)`) or just its
+      payload (`Some(x)`). The selected arm acquires the root at the type it
+      bound. In `whole @ Err(reason)`, only `whole` owns a root; `reason` is
+      ownership-free.
+   3. An arm that can select a present payload MUST NOT discard it by binding
+      neither the carrier nor the payload (`OWNERSHIP_DISCARD_FORBIDDEN`).
+      This includes `Some(_)` and `Ok(..)` without an enclosing owning binding.
+      Selecting `None` or `Err(e)` without binding the carrier creates no root.
 10. Pattern bindings are tentative while a guard is evaluated:
    1. a tentative ownership binding MAY be used only through a non-escaping shared borrow,
    2. `move`, `drop_own`, by-value transfer, and every other consuming use of a tentative ownership binding MUST fail with `OWNERSHIP_GUARD_CONSUME_FORBIDDEN`,
    3. a guard-false path retains the complete moved scrutinee inside match evaluation for later arms,
-   4. a guard-true path ends any guard borrow before the selected arm establishes its payload binding as a direct root.
+   4. a guard-true path ends any guard borrow before the selected arm acquires the root bound under Rule 9.
 11. Move-binding patterns such as `Some(move x)` are not part of the v0.1 pattern surface.
 12. Borrow-only carrier queries whose receiver is `&Self` MAY inspect a conditional root without consuming it.
 13. Ordinary by-value generic adapters on `Opt` or `Res` are not available when their type arguments form a conditional ownership root unless this section explicitly defines the operation.

@@ -615,6 +615,9 @@ Tensor determinism coverage additionally requires:
    18. `Own[T]` does not generally forward methods from `T` or implement `Clone`; cloning a root requires `METHOD_NOT_FOUND`, while designated resource methods resolve only on their explicit `Own[R]` wrapper types.
    19. associated type bindings remain ownership-free and reject direct or conditional-carrier ownership bindings with `OWNERSHIP_TYPE_POSITION_FORBIDDEN`; an alias that hides an ownership root is already rejected at its alias declaration and is not claimed as a distinct associated-binding path.
    20. ownership-position validation remains primary when an `Own[...]` payload, generic argument, or associated binding also violates the reference-free abstraction-slot rule.
+   21. two owning bindings on one alternative of a conditional-root match
+       pattern require `PATTERN_OWNERSHIP_BINDING_OVERLAP`; one owning binding
+       may coexist with ownership-free bindings.
 28. Implementations MAY expose non-baseline ownership-disabled mode; if such mode is tested, ownership syntax/type-surface paths (including `Own[...]`) require `OWNERSHIP_PROFILE_DISABLED`.
 29. `CAPABILITY_*` diagnostics are extension-profile codes and are outside required v0.1 conformance unless capability features are explicitly enabled.
 30. ADT baseline suites require:

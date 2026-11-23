@@ -1,5 +1,24 @@
 use super::*;
 
+#[derive(Default)]
+struct CarrierBindings {
+    enclosing: Option<OriginId>,
+    overlap: Option<(OriginId, OriginId)>,
+}
+
+impl CarrierBindings {
+    fn bind(&mut self, origin: OriginId) {
+        if let Some(first) = self.enclosing {
+            self.overlap.get_or_insert((first, origin));
+        }
+    }
+
+    fn enter_alias(&mut self, origin: OriginId) -> Option<OriginId> {
+        self.bind(origin);
+        self.enclosing.replace(origin)
+    }
+}
+
 enum PatternPlan<'hir> {
     Complete(Outcome<PatternCheck>),
     Child {
@@ -13,6 +32,7 @@ enum PatternContinuation<'hir> {
     Alias {
         binding: LocalBindingId,
         expected: TypeId,
+        enclosing: Option<OriginId>,
     },
     Group,
     Tuple {
@@ -72,10 +92,16 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             .pattern(pattern_id)
             .ok_or(BodyTypingError::WrongBodyPattern(pattern_id))?;
         self.pattern_bindings.begin(context.module, pattern_id);
+        let mut owners = matches!(
+            self.signatures.types().ownership_root(expected)?,
+            Some(crate::OwnershipRoot::Optional { .. } | crate::OwnershipRoot::Result { .. })
+        )
+        .then(CarrierBindings::default);
         let mut pending = (pattern_id, expected);
         let mut continuations = Vec::new();
         loop {
-            let mut plan = self.prepare_match_pattern(context, pending.0, pending.1)?;
+            let mut plan =
+                self.prepare_match_pattern(context, pending.0, pending.1, owners.as_mut())?;
             loop {
                 match plan {
                     PatternPlan::Child {
@@ -89,9 +115,18 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     }
                     PatternPlan::Complete(outcome) => {
                         let Some(continuation) = continuations.pop() else {
+                            if matches!(outcome, Outcome::Known(_))
+                                && let Some(poison) = self.match_binding_error(
+                                    context,
+                                    pattern_id,
+                                    owners.and_then(|b| b.overlap),
+                                )?
+                            {
+                                return Ok(Outcome::Poisoned(poison));
+                            }
                             return Ok(outcome);
                         };
-                        plan = self.resume_match_pattern(continuation, outcome)?;
+                        plan = self.resume_match_pattern(continuation, outcome, owners.as_mut())?;
                     }
                 }
             }
@@ -103,6 +138,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         context: BodyContext<'_, 'body>,
         pattern_id: PatternId,
         expected: TypeId,
+        owners: Option<&mut CarrierBindings>,
     ) -> Result<PatternPlan<'body>, BodyFlow> {
         let BodyContext {
             module,
@@ -160,6 +196,11 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 self.pattern_bindings
                     .observe(binding, pattern_id, name.origin())?;
                 self.pattern_bindings.type_binding(binding, expected)?;
+                if let Some(owners) = owners
+                    && self.signatures.types().ownership_root(expected)?.is_some()
+                {
+                    owners.bind(name.origin());
+                }
                 Ok(PatternPlan::Complete(Outcome::Known(
                     PatternCheck::irrefutable(),
                 )))
@@ -176,10 +217,21 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 )?;
                 self.pattern_bindings
                     .observe(binding, pattern_id, name.origin())?;
+                let enclosing = match owners {
+                    Some(owners) if self.signatures.types().ownership_root(expected)?.is_some() => {
+                        owners.enter_alias(name.origin())
+                    }
+                    Some(owners) => owners.enclosing,
+                    None => None,
+                };
                 Ok(PatternPlan::Child {
                     pattern: *pattern,
                     expected,
-                    continuation: PatternContinuation::Alias { binding, expected },
+                    continuation: PatternContinuation::Alias {
+                        binding,
+                        expected,
+                        enclosing,
+                    },
                 })
             }
             PatternKind::Group(pattern) => Ok(PatternPlan::Child {
@@ -500,9 +552,17 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         &mut self,
         continuation: PatternContinuation<'body>,
         outcome: Outcome<PatternCheck>,
+        owners: Option<&mut CarrierBindings>,
     ) -> Result<PatternPlan<'body>, BodyFlow> {
         match continuation {
-            PatternContinuation::Alias { binding, expected } => {
+            PatternContinuation::Alias {
+                binding,
+                expected,
+                enclosing,
+            } => {
+                if let Some(owners) = owners {
+                    owners.enclosing = enclosing;
+                }
                 if let Outcome::Known(_) = &outcome {
                     self.pattern_bindings.type_binding(binding, expected)?;
                 }
