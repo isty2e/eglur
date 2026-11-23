@@ -1622,7 +1622,7 @@ coverage:
     asserted_in:
       - id: core-ownership
         file: core/ownership.yaml
-        test_ids: [OWN-discard-target-cannot-consume-root-even-with-move, OWN-match-cannot-discard-an-unnamed-present-payload, OWN-overwriting-root-is-forbidden, OWN-unused-fresh-root-expression-is-forbidden]
+        test_ids: [OWN-discard-target-cannot-consume-root-even-with-move, OWN-match-cannot-discard-an-unnamed-present-payload, OWN-overwriting-root-is-forbidden, OWN-result-rest-cannot-discard-an-owned-ok-payload, OWN-unused-fresh-root-expression-is-forbidden, OWN-wildcard-after-guarded-some-can-still-discard-a-payload]
     mentioned_only_in: []
   - code: OWNERSHIP_DOUBLE_MOVE
     severity: error

@@ -15726,7 +15726,7 @@
       "public_examples": [],
       "source": {
         "kind": "utf8",
-        "text": "fn lose(v: Opt[Own[i64]]) -> i64 = match move v {\n  Some(_) => 1,\n  None => 0\n}\n\nfn main!() -> Res[Str, Str] = Ok(\"unused\")\n"
+        "text": "fn lose(v: Opt[Own[i64]]) -> i64 = match move v {\n  Some(_) => 1,\n  None => 0\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 3\n  yield Ok(to_str(lose(Some(own n))))\n}\n"
       }
     },
     {
@@ -16333,6 +16333,24 @@
       "origin": {
         "kind": "inline_conformance",
         "suite_id": "core-ownership",
+        "test_id": "OWN-result-rest-cannot-discard-an-owned-ok-payload"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn lose(r: Res[Own[i64], Str]) -> Str = match move r {\n  Ok(..) => \"lost\",\n  Err(reason) => reason\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 3\n  yield Ok(lose(Ok(own n)))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
         "test_id": "OWN-return-exits-all-active-obligation-regions"
       },
       "public_examples": [],
@@ -16519,6 +16537,42 @@
       "source": {
         "kind": "utf8",
         "text": "struct Holder {\n  field value: Own[i64]\n}\n\nfn main!() -> Res[Str, Str] {\n  yield Ok(\"x\")\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-wildcard-after-guarded-some-can-still-discard-a-payload"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "fn release(v: Opt[Own[i64]], take: Bool) -> i64 = match move v {\n  Some(root) if take => { drop_own move root\n                          yield 1 },\n  _ => 0\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 3\n  yield Ok(to_str(release(Some(own n), false)))\n}\n"
+      }
+    },
+    {
+      "entrypoint": "compilation_unit",
+      "expectation": {
+        "diagnostic_code": null,
+        "kind": "success",
+        "primary_span": null
+      },
+      "origin": {
+        "kind": "inline_conformance",
+        "suite_id": "core-ownership",
+        "test_id": "OWN-wildcard-after-unconditional-ok-can-only-select-err"
+      },
+      "public_examples": [],
+      "source": {
+        "kind": "utf8",
+        "text": "import std::test::emit!\n\nfn release(r: Res[Own[i64], Str]) -> Str = match move r {\n  Ok(root) => { drop_own move root\n                yield \"released\" },\n  _ => \"empty\"\n}\n\nfn main!() -> Res[Str, Str] {\n  let n: i64 = 3\n  emit!(release(Ok(own n)))\n  yield Ok(release(Err(\"failed\")))\n}\n"
       }
     },
     {
@@ -39929,6 +39983,6 @@
       }
     }
   ],
-  "input_digest": "sha256:9e661dd2bf60c88d7aec7006668348370ef5134ca8d428cf609bcaad6f4a1663",
+  "input_digest": "sha256:5f47612e9ada8545eeae23f29a7515bbe8885e176606db108fb01260ea395f28",
   "schema_version": "0.1"
 }

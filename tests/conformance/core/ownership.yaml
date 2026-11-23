@@ -353,7 +353,76 @@ tests:
       None => 0
     }
 
-    fn main!() -> Res[Str, Str] = Ok("unused")
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(to_str(lose(Some(own n))))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
+- id: OWN-result-rest-cannot-discard-an-owned-ok-payload
+  category: ownership
+  title: Ok(..) matches the payload without acquiring it
+  code: |
+    fn lose(r: Res[Own[i64], Str]) -> Str = match move r {
+      Ok(..) => "lost",
+      Err(reason) => reason
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(lose(Ok(own n)))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
+- id: OWN-wildcard-after-unconditional-ok-can-only-select-err
+  category: ownership
+  title: a wildcard may follow an arm that takes every owned Ok payload
+  code: |
+    import std::test::emit!
+
+    fn release(r: Res[Own[i64], Str]) -> Str = match move r {
+      Ok(root) => { drop_own move root
+                    yield "released" },
+      _ => "empty"
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(release(Ok(own n)))
+      yield Ok(release(Err("failed")))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"empty"'
+    side_effects:
+    - released
+- id: OWN-wildcard-after-guarded-some-can-still-discard-a-payload
+  category: ownership
+  title: a false guard leaves the owned Some payload for the wildcard
+  code: |
+    fn release(v: Opt[Own[i64]], take: Bool) -> i64 = match move v {
+      Some(root) if take => { drop_own move root
+                              yield 1 },
+      _ => 0
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(to_str(release(Some(own n), false)))
+    }
   expect:
     compile_error:
       code: OWNERSHIP_DISCARD_FORBIDDEN
