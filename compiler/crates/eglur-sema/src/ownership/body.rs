@@ -1,8 +1,10 @@
 mod branches;
+mod provenance;
 mod traversal;
 
+use provenance::ValueProvenance;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
 
 use eglur_hir::{
     Body, ConstructorPayload, ExprId, ExprKind, OriginId, PatternId, PatternKind,
@@ -23,7 +25,7 @@ use super::{
     OwnershipAvailability, OwnershipBodyStatus, OwnershipBodySummary, OwnershipFailure,
     OwnershipFailureKind, OwnershipRootFact,
 };
-use branches::{Alternatives, FlowState, RecoverableExits};
+use branches::{Alternatives, FlowState, GuardScope, MatchPaths, RecoverableExits};
 use eglur_diagnostics::{Poison, PoisonAccumulator};
 
 pub(super) struct OwnershipBodyAnalysis {
@@ -106,78 +108,6 @@ impl Default for AvailabilityFact {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct ValueProvenance {
-    roots_by_tuple_path: BTreeMap<Vec<usize>, BTreeSet<LocalBindingId>>,
-}
-
-impl ValueProvenance {
-    fn is_empty(&self) -> bool {
-        self.roots_by_tuple_path.is_empty()
-    }
-
-    fn direct(roots: BTreeSet<LocalBindingId>) -> Self {
-        let mut provenance = Self::default();
-        if !roots.is_empty() {
-            provenance.roots_by_tuple_path.insert(Vec::new(), roots);
-        }
-        provenance
-    }
-
-    fn extend(&mut self, other: Self) {
-        for (path, roots) in other.roots_by_tuple_path {
-            self.roots_by_tuple_path
-                .entry(path)
-                .or_default()
-                .extend(roots);
-        }
-    }
-
-    fn prefixed(self, index: usize) -> Self {
-        let roots_by_tuple_path = self
-            .roots_by_tuple_path
-            .into_iter()
-            .map(|(path, roots)| {
-                let mut prefixed = Vec::with_capacity(path.len() + 1);
-                prefixed.push(index);
-                prefixed.extend(path);
-                (prefixed, roots)
-            })
-            .collect();
-        Self {
-            roots_by_tuple_path,
-        }
-    }
-
-    fn projected(&self, index: usize) -> Self {
-        let lower = [index];
-        let upper = index.checked_add(1).map(|next| [next]);
-        let bounds = (
-            Bound::Included(lower.as_slice()),
-            upper
-                .as_ref()
-                .map_or(Bound::Unbounded, |upper| Bound::Excluded(upper.as_slice())),
-        );
-        let mut projected = Self::default();
-        for (path, roots) in self.roots_by_tuple_path.range::<[usize], _>(bounds) {
-            projected
-                .roots_by_tuple_path
-                .entry(path[1..].to_vec())
-                .or_default()
-                .extend(roots);
-        }
-        projected
-    }
-
-    fn roots(&self) -> BTreeSet<LocalBindingId> {
-        self.roots_by_tuple_path
-            .values()
-            .flatten()
-            .copied()
-            .collect()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 struct ExpressionFlow {
     continuing: bool,
@@ -218,6 +148,7 @@ pub(super) fn analyze_body(
         locals_by_region: BTreeMap::new(),
         failures: Vec::new(),
         operation_count: 0,
+        guard_serial: 0,
         unperformed: false,
         recoverable_exits: Vec::new(),
         tentative: BTreeSet::new(),
@@ -329,6 +260,7 @@ struct BodyAnalyzer<'analysis> {
     locals_by_region: BTreeMap<ControlRegionKey, BTreeSet<LocalBindingId>>,
     failures: Vec<OwnershipFailure>,
     operation_count: usize,
+    guard_serial: usize,
     unperformed: bool,
     recoverable_exits: Vec<(ControlRegionKey, RecoverableExits)>,
     tentative: BTreeSet<LocalBindingId>,
@@ -807,11 +739,7 @@ impl BodyAnalyzer<'_> {
                 .rev()
                 .find(|(region, _)| region == transfer.target())
             {
-                let mut exit_state = state.exit_snapshot();
-                for id in leaving {
-                    exit_state.end_binding(id);
-                }
-                exits.include(exit_state);
+                exits.include(state, leaving);
             }
         }
     }
@@ -887,27 +815,29 @@ impl BodyAnalyzer<'_> {
         bindings
     }
 
-    fn expression_roots(
+    fn place_provenance(
         &self,
         mut expression: ExprId,
         state: &FlowState,
-    ) -> Result<BTreeSet<LocalBindingId>, OwnershipAnalysisError> {
+    ) -> Result<ValueProvenance, OwnershipAnalysisError> {
         loop {
             let key = ExpressionKey::new(self.module, expression);
             let FactState::Known(typed) = self.body_types.expression(key) else {
-                return Ok(BTreeSet::new());
+                return Ok(ValueProvenance::default());
             };
             let Some(place) = typed.place() else {
-                return Ok(BTreeSet::new());
+                return Ok(ValueProvenance::default());
             };
             match place.kind() {
                 TypedPlaceKind::Local(binding) if self.binding_is_reference(*binding)? => {
                     return Ok(state
                         .alias(*binding)
-                        .map(ValueProvenance::roots)
+                        .map(ValueProvenance::borrowed)
                         .unwrap_or_default());
                 }
-                TypedPlaceKind::Local(binding) => return Ok(BTreeSet::from([*binding])),
+                TypedPlaceKind::Local(binding) => {
+                    return Ok(ValueProvenance::direct(BTreeSet::from([*binding])));
+                }
                 TypedPlaceKind::StoredField { receiver, .. }
                 | TypedPlaceKind::TupleElement { receiver, .. } => expression = *receiver,
                 TypedPlaceKind::Dereference { reference } => expression = *reference,

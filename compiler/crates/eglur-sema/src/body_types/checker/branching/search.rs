@@ -146,6 +146,12 @@ impl ArmSearch {
         }
     }
 
+    pub(super) fn whole_constructors(&self) -> Option<ConstructorSet> {
+        self.domain.constructors.as_ref()?;
+        (!self.matched.contains(&Portion::Part))
+            .then(|| ConstructorSet(self.matched.map(|part| part == Portion::All)))
+    }
+
     /// Only misses continue. A partial head retains an unknown subset of its constructor.
     pub(super) fn keep_misses(&mut self) {
         for (remaining, portion) in self.remaining.iter_mut().zip(self.matched) {

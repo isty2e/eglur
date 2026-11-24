@@ -125,17 +125,24 @@ variant patterns remain unsupported.
 
 The ownership pass checks straight-line code, `if` branches, `result` and
 `checked` exits, and `match` on ordinary values and owned `Opt` or `Res`
-carriers. Different arms can move the same outer root: each arm starts after
-the scrutinee. Only arms that continue contribute to the state after the match.
+carriers. Mutually exclusive arm bodies can move the same outer root.
+Only paths that continue past the match contribute to the state that follows it.
 A consuming pattern binds an owned value only after its guard succeeds. If
 the guard returns or propagates an error out of the match, the checker
 verifies that it cannot leave an owned payload behind.
 
-If a guard always exits the match, values that miss its pattern can still
-reach later arms. If a guard can return `false` after changing an outer root
-or reference, the checker reports `typecheck.complete_ownership_flow` for
-that callable. An incomplete body prevents the program from sealing, but
-checked siblings keep their diagnostics.
+In an `Opt` or `Res` match whose patterns cover whole constructors, the
+checker distinguishes a pattern miss from a guard that evaluates to `false`.
+For example, if a `Some(_)` guard moves an outer root and yields `false`,
+a later `Some` arm sees the move. A `None` value skips that guard entirely.
+The same distinction applies to reference assignments. If both constructors
+reach one arm body, a borrow in that body, even inside a nested match, must
+be valid for every referent that can reach it.
+
+The checker can still report `typecheck.complete_ownership_flow` when a move
+depends on a payload pattern such as `Some(0)`, or when a guard assigns
+different referents on its true and false paths. An incomplete body prevents
+the program from sealing, but checked siblings keep their diagnostics.
 Loops and closures stop earlier, during body typing.
 
 `SupportProfile::tensor_constructors_v1()` adds static checks for positional

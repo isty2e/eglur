@@ -104,7 +104,7 @@ pub(super) struct MatchFrame {
     any_normal_arm: bool,
     patterns: Vec<PatternCheck>,
     search: Option<ArmSearch>,
-    entries: Vec<NormalContinuation>,
+    entries: Vec<MatchArmControl>,
     poison: PendingPoison,
     unperformed: bool,
     deferred: bool,
@@ -507,8 +507,8 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     .into_iter()
                     .enumerate()
                     .map(|(i, entry)| MatchArmControl {
-                        entry,
                         carrier: checked.carriers.as_ref().map(|carriers| carriers[i]),
+                        ..entry
                     })
                     .collect::<Box<[_]>>();
                 if let Some(existing) = self.match_arms.get(&frame.owner) {
@@ -565,11 +565,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         } else {
             NormalContinuation::Present
         };
+        let mut constructors = None;
         match pattern {
             Outcome::Known(pattern) => {
                 self.install_match_bindings(module, arm.pattern)?;
                 if let Some(search) = &mut frame.search {
                     entry = entry.strict(search.enter(&pattern));
+                    constructors = search.whole_constructors();
                     if entry.is_present() && search.uncertain_entry() {
                         self.demand_unimplemented(
                             TypecheckCapability::AnalyzePatternCoverage,
@@ -591,7 +593,11 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
             Outcome::Deferred => frame.deferred = true,
         }
-        frame.entries.push(entry);
+        frame.entries.push(MatchArmControl {
+            entry,
+            constructors,
+            carrier: None,
+        });
         if let Some(guard) = &arm.guard {
             let bool_ty = self.primitive(PrimitiveType::Bool)?;
             return Ok(BranchPlan::Expression {
@@ -643,7 +649,9 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 {
                     search.stop_matched();
                 }
-                frame.entries[frame.next_arm].strict(value.normal_continuation)
+                frame.entries[frame.next_arm]
+                    .entry
+                    .strict(value.normal_continuation)
             }
             Outcome::Poisoned(found) => {
                 frame.poison.include(&found)?;

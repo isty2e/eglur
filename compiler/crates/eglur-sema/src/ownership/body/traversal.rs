@@ -38,17 +38,74 @@ struct IfFrame {
     owner: ExpressionKey,
     remaining: std::array::IntoIter<(IfBranch, Option<ExprId>), 3>,
     branches: Alternatives,
-    provenance: ValueProvenance,
+    provenance: NormalValues,
 }
 
 struct MatchFrame<'hir> {
     owner: ExpressionKey,
     remaining: std::iter::Enumerate<std::slice::Iter<'hir, eglur_hir::MatchArm>>,
-    branches: Alternatives,
+    branches: MatchPaths,
     subject: ValueProvenance,
-    result: ValueProvenance,
+    result: NormalValues,
     carrier: Option<OriginId>,
     search_input_known: bool,
+    local_regions: ArmScopes,
+}
+
+#[derive(Default)]
+struct NormalValues(Option<ValueProvenance>);
+
+impl NormalValues {
+    fn include(&mut self, value: ValueProvenance, state: &FlowState) {
+        if let Some(joined) = &mut self.0 {
+            joined.join_choice(value, state.split_guard_stamp());
+        } else {
+            self.0 = Some(value);
+        }
+    }
+
+    fn finish(self) -> ValueProvenance {
+        self.0.unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct ArmScopes(BTreeMap<ControlRegionKey, bool>);
+
+impl ArmScopes {
+    fn survives(
+        &mut self,
+        owner: ExpressionKey,
+        id: LocalBindingId,
+        types: &BodyTypes,
+    ) -> Option<bool> {
+        let FactState::Known(local) = types.local(id) else {
+            return None;
+        };
+        let mut region = local.region();
+        let mut path = Vec::new();
+        let survives = loop {
+            if matches!(region, ControlRegionKey::MatchArm { owner: arm_owner, .. } if *arm_owner == owner)
+            {
+                break false;
+            }
+            if let Some(&known) = self.0.get(region) {
+                break known;
+            }
+            path.push(region.clone());
+            let FactState::Known(fact) = types.region(region) else {
+                return None;
+            };
+            let Some(parent) = fact.parent() else {
+                break true;
+            };
+            region = parent;
+        };
+        for region in path {
+            self.0.insert(region, survives);
+        }
+        Some(survives)
+    }
 }
 
 enum ArmBody {
@@ -76,16 +133,18 @@ impl<'hir> MatchFrame<'hir> {
         selection: ArmBody,
         pending: &mut Vec<Step<'hir>>,
     ) -> Result<(), OwnershipAnalysisError> {
-        pending.push(Step::MatchValue(self, region, arm.origin));
-        pending.push(match selection {
+        let value = match selection {
             ArmBody::Selected(carrier) => {
+                self.branches.select_body(state);
                 if let Some(binding) = carrier.and_then(CarrierArm::binding) {
                     analyzer.introduce_root(binding, state)?;
                 }
                 Step::Expression(arm.value, None)
             }
             ArmBody::WrittenOnly => Step::Written(Written::Expression(arm.value)),
-        });
+        };
+        pending.push(Step::MatchValue(self, region, arm.origin));
+        pending.push(value);
         Ok(())
     }
 }
@@ -134,6 +193,7 @@ enum Step<'hir> {
         ControlRegionKey,
         &'hir eglur_hir::MatchArm,
         Option<CarrierArm>,
+        Option<GuardScope>,
     ),
     MatchValue(MatchFrame<'hir>, ControlRegionKey, OriginId),
     BlockNext(BlockFrame<'hir>),
@@ -215,9 +275,9 @@ impl<'hir> BodyAnalyzer<'hir> {
                         !state.has_input() || self.expression_continues(key, flow.continuing);
                 }
                 Step::Reference(value) => {
-                    let mut roots = flow.provenance.roots();
-                    roots.extend(self.expression_roots(value, state)?);
-                    flow.provenance = ValueProvenance::direct(roots);
+                    let mut borrowed = flow.provenance.borrowed();
+                    borrowed.extend(self.place_provenance(value, state)?);
+                    flow.provenance = borrowed;
                 }
                 Step::BorrowTentative(binding, origin) => {
                     self.use_binding(binding, origin, state);
@@ -267,7 +327,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                             ]
                             .into_iter(),
                             branches: Alternatives::begin(state),
-                            provenance: ValueProvenance::default(),
+                            provenance: NormalValues::default(),
                         }));
                     } else {
                         for id in [
@@ -290,7 +350,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                     if flow.continuing {
                         frame
                             .provenance
-                            .extend(std::mem::take(&mut flow.provenance));
+                            .include(std::mem::take(&mut flow.provenance), state);
                     }
                     frame.branches.finish_arm(state, flow.continuing);
                     pending.push(Step::IfNext(frame));
@@ -320,11 +380,17 @@ impl<'hir> BodyAnalyzer<'hir> {
                     pending.push(Step::MatchNext(MatchFrame {
                         owner,
                         remaining: value.arms.iter().enumerate(),
-                        branches: Alternatives::begin(state),
+                        branches: MatchPaths::begin(
+                            state,
+                            owner,
+                            value.arms.iter().any(|arm| arm.guard.is_some())
+                                && self.body_types.has_whole_constructor_entries(owner),
+                        ),
                         subject,
-                        result: ValueProvenance::default(),
+                        result: NormalValues::default(),
                         carrier,
                         search_input_known: true,
+                        local_regions: ArmScopes::default(),
                     }));
                 }
                 Step::MatchNext(mut frame) => {
@@ -334,6 +400,9 @@ impl<'hir> BodyAnalyzer<'hir> {
                             arm,
                         };
                         let control = self.body_types.match_arm(&region);
+                        frame
+                            .branches
+                            .enter(state, control.and_then(|control| control.constructors));
                         let enters = frame.search_input_known
                             && control.is_some_and(|control| control.can_enter());
                         if control.is_none() {
@@ -377,7 +446,15 @@ impl<'hir> BodyAnalyzer<'hir> {
                                     self.tentative.insert(binding);
                                 }
                             }
-                            pending.push(Step::MatchGuard(frame, region, value, carrier_arm));
+                            self.guard_serial += 1;
+                            let parent = state.begin_guard(self.guard_serial);
+                            pending.push(Step::MatchGuard(
+                                frame,
+                                region,
+                                value,
+                                carrier_arm,
+                                parent,
+                            ));
                             pending.push(if enters {
                                 Step::Expression(guard.condition, None)
                             } else {
@@ -394,13 +471,18 @@ impl<'hir> BodyAnalyzer<'hir> {
                             )?;
                         }
                     } else {
+                        let mut result = frame.result.finish();
+                        if matches!(frame.branches, MatchPaths::Ordered) {
+                            result.forget_constructors(state.split_guard_stamp());
+                        }
                         flow = ExpressionFlow {
                             continuing: frame.branches.finish(state),
-                            provenance: frame.result,
+                            provenance: result,
                         };
                     }
                 }
-                Step::MatchGuard(mut frame, region, arm, carrier_arm) => {
+                Step::MatchGuard(mut frame, region, arm, carrier_arm, parent) => {
+                    let guard = state.end_guard(parent);
                     if let Some(guard) = &arm.guard
                         && self.poisoned_value(ExpressionKey::new(self.module, guard.condition))
                     {
@@ -416,11 +498,13 @@ impl<'hir> BodyAnalyzer<'hir> {
                             self.tentative.remove(&binding);
                         }
                     }
-                    // A pattern miss and a false guard can share the next arm's entry
-                    // only if they agree on every binding that survives this arm.
-                    if flow.continuing && frame.branches.changed_bindings(state).any(|id| {
-                        !matches!(self.body_types.local(id), FactState::Known(local) if local.region() == &region)
-                    }) {
+                    if flow.continuing
+                        && !frame.branches.guard_false(state, guard, |id| {
+                            frame
+                                .local_regions
+                                .survives(frame.owner, id, self.body_types)
+                        })
+                    {
                         self.unperformed = true;
                     }
                     frame.schedule_value(
@@ -440,7 +524,9 @@ impl<'hir> BodyAnalyzer<'hir> {
                             false,
                             state,
                         );
-                        frame.result.extend(std::mem::take(&mut flow.provenance));
+                        frame
+                            .result
+                            .include(std::mem::take(&mut flow.provenance), state);
                     }
                     frame.branches.finish_arm(state, flow.continuing);
                     pending.push(Step::MatchNext(frame));
@@ -603,6 +689,22 @@ impl<'hir> BodyAnalyzer<'hir> {
         let key = ExpressionKey::new(self.module, id);
         pending.push(Step::FinishExpression(key, origin));
         *flow = ExpressionFlow::continuing();
+        if state.has_input()
+            && matches!(
+                expression.kind(),
+                ExprKind::If(_)
+                    | ExprKind::Match(_)
+                    | ExprKind::Result(_)
+                    | ExprKind::Checked(_)
+                    | ExprKind::Binary {
+                        operator: eglur_hir::BinaryOperator::LogicalAnd
+                            | eglur_hir::BinaryOperator::LogicalOr,
+                        ..
+                    }
+            )
+        {
+            state.note_guard_split();
+        }
         match expression.kind() {
             ExprKind::Block { statements } => pending.push(Step::BlockNext(BlockFrame {
                 remaining: statements.iter(),
@@ -704,7 +806,7 @@ impl<'hir> BodyAnalyzer<'hir> {
                     ControlRegionKey::Checked(key)
                 };
                 self.recoverable_exits
-                    .push((region.clone(), RecoverableExits::default()));
+                    .push((region.clone(), RecoverableExits::begin(state)));
                 pending.push(Step::Recoverable(region.clone()));
                 pending.push(Step::Expression(*inner, Some(region)));
             }
@@ -984,7 +1086,7 @@ impl<'hir> BodyAnalyzer<'hir> {
         }
         *flow = ExpressionFlow {
             continuing: frame.branches.finish(state),
-            provenance: frame.provenance,
+            provenance: frame.provenance.finish(),
         };
     }
 }
