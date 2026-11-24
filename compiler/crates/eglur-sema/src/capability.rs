@@ -569,6 +569,7 @@ pub enum PhaseProduct<T> {
 pub(crate) struct DemandRecorder<'support> {
     support: &'support dyn CompileSupport,
     demands: Vec<CapabilityDemand>,
+    unavailable_count: usize,
 }
 
 impl<'support> DemandRecorder<'support> {
@@ -576,7 +577,16 @@ impl<'support> DemandRecorder<'support> {
         Self {
             support,
             demands: Vec::new(),
+            unavailable_count: 0,
         }
+    }
+
+    pub(crate) fn supports(&self, capability: CompileCapability) -> bool {
+        self.support.supports(capability)
+    }
+
+    pub(crate) fn unavailable_count(&self) -> usize {
+        self.unavailable_count
     }
 
     pub(crate) fn require(
@@ -584,7 +594,8 @@ impl<'support> DemandRecorder<'support> {
         capability: CompileCapability,
         location: SemanticLocation,
     ) -> bool {
-        let supported = self.support.supports(capability);
+        let supported = self.supports(capability);
+        self.unavailable_count += usize::from(!supported);
         self.demands.push(CapabilityDemand {
             capability,
             location,
@@ -604,6 +615,7 @@ impl<'support> DemandRecorder<'support> {
         location: SemanticLocation,
     ) {
         let capability = input.capability();
+        self.unavailable_count += 1;
         let disposition = if self.support.supports(capability) {
             DemandDisposition::Satisfied
         } else {

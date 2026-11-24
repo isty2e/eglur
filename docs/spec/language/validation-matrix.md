@@ -158,7 +158,8 @@ This order applies regardless of lowering/fusion choices.
    78. `PATTERN_DUPLICATE_FIELD`,
    79. `PATTERN_UNKNOWN_FIELD`,
    80. `PATTERN_MISSING_FIELD`,
-   81. `PATTERN_DUPLICATE_BINDING`.
+   81. `PATTERN_DUPLICATE_BINDING`,
+   82. `PATTERN_OWNERSHIP_BINDING_OVERLAP`.
 4. Property declaration/accessor validation is compile-time only:
    1. missing/wrong property accessor contracts use `PROP_ACCESSOR_MISSING` / `PROP_ACCESSOR_SIGNATURE_MISMATCH`,
    2. these declaration-level codes take primary precedence over ordinary receiver/effect-signature validation for the same accessor declaration.

@@ -94,15 +94,29 @@ pub(crate) enum OwnershipFailureKind {
     DoubleMove,
     UseAfterDischarge,
     PathUnbalanced,
+    GuardConsume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OwnershipCause {
+    Binding {
+        kind: OwnershipFailureKind,
+        binding: LocalBindingId,
+        first_consume: Option<OriginId>,
+    },
+    PendingMatchExit {
+        scrutinee: OriginId,
+    },
+    UnboundMatchPayload {
+        scrutinee: OriginId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OwnershipFailure {
     owner: DefId,
-    kind: OwnershipFailureKind,
+    cause: OwnershipCause,
     origin: OriginId,
-    binding: LocalBindingId,
-    related_origin: Option<OriginId>,
     closing_delimiter: bool,
 }
 
@@ -112,14 +126,24 @@ impl OwnershipFailure {
         kind: OwnershipFailureKind,
         origin: OriginId,
         binding: LocalBindingId,
-        related_origin: Option<OriginId>,
+        first_consume: Option<OriginId>,
     ) -> Self {
+        Self::at(
+            owner,
+            origin,
+            OwnershipCause::Binding {
+                kind,
+                binding,
+                first_consume,
+            },
+        )
+    }
+
+    pub(super) const fn at(owner: DefId, origin: OriginId, cause: OwnershipCause) -> Self {
         Self {
             owner,
-            kind,
+            cause,
             origin,
-            binding,
-            related_origin,
             closing_delimiter: false,
         }
     }
@@ -133,20 +157,12 @@ impl OwnershipFailure {
         self.owner
     }
 
-    pub(crate) const fn kind(&self) -> OwnershipFailureKind {
-        self.kind
+    pub(super) const fn cause(&self) -> OwnershipCause {
+        self.cause
     }
 
     pub(crate) const fn origin(&self) -> OriginId {
         self.origin
-    }
-
-    pub(crate) const fn binding(&self) -> LocalBindingId {
-        self.binding
-    }
-
-    pub(crate) const fn related_origin(&self) -> Option<OriginId> {
-        self.related_origin
     }
 
     pub(crate) const fn closing_delimiter(&self) -> bool {

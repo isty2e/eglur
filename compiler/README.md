@@ -123,12 +123,20 @@ including through type aliases and nested patterns. Catalog payloads also
 determine enum inhabitance. External variant construction and qualified external
 variant patterns remain unsupported.
 
-The bounded ownership pass checks straight-line code, `if` branches, and
-`result`/`checked` exits. A typed body that this pass cannot finish reports
-`typecheck.complete_ownership_flow` at its callable; ownership-relevant `match`
-is one such case. It cannot produce a checked program, but checked sibling
-bodies and their diagnostics are retained. Loops and closures currently stop
-during body typing and keep their own missing-capability reports.
+The ownership pass checks straight-line code, `if` branches, `result` and
+`checked` exits, and `match` on ordinary values and owned `Opt` or `Res`
+carriers. Different arms can move the same outer root: each arm starts after
+the scrutinee. Only arms that continue contribute to the state after the match.
+A consuming pattern binds an owned value only after its guard succeeds. If
+the guard returns or propagates an error out of the match, the checker
+verifies that it cannot leave an owned payload behind.
+
+If a guard always exits the match, values that miss its pattern can still
+reach later arms. If a guard can return `false` after changing an outer root
+or reference, the checker reports `typecheck.complete_ownership_flow` for
+that callable. An incomplete body prevents the program from sealing, but
+checked siblings keep their diagnostics.
+Loops and closures stop earlier, during body typing.
 
 `SupportProfile::tensor_constructors_v1()` adds static checks for positional
 `zeros[T](...)`, `ones[T](...)`, `nan[f32](...)`, and `rand![f32](...)` calls.

@@ -100,6 +100,143 @@ fn duplicate_aliases_report_the_later_binding_not_an_internal_collision() {
 }
 
 #[test]
+fn consuming_carrier_patterns_reject_the_second_owning_binding() {
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    for (input, subject, pattern, first, later) in [
+        (
+            "v: Opt[Own[i64]]",
+            "move v",
+            "whole @ Some(item)",
+            "whole",
+            "item",
+        ),
+        (
+            "v: Res[Own[i64], Str]",
+            "move v",
+            "whole @ Ok(item)",
+            "whole",
+            "item",
+        ),
+        (
+            "v: Opt[Own[i64]]",
+            "move v",
+            "Some(first @ (second))",
+            "first",
+            "second",
+        ),
+        (
+            "v: Opt[Own[i64]]",
+            "move v",
+            "one @ two @ Some(three)",
+            "one",
+            "two",
+        ),
+        (
+            "v: Opt[Own[i64]]",
+            "move v",
+            "one @ two @ None",
+            "one",
+            "two",
+        ),
+        (
+            "n: i64",
+            "Some(own n)",
+            "whole @ Some(item)",
+            "whole",
+            "item",
+        ),
+    ] {
+        let source = format!(
+            "fn f({input}) -> i64 = match {subject} {{ {pattern} if false => 0, rest => {{ drop_own move rest\nyield 1 }} }}\n"
+        );
+        let mut compiler = session(&source);
+        compiler
+            .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+            .unwrap();
+        let snapshot = compiler.into_diagnostics(None);
+        assert_eq!(
+            diagnostic_codes(&snapshot),
+            ["PATTERN_OWNERSHIP_BINDING_OVERLAP"],
+            "{source}"
+        );
+        let diagnostic = &snapshot.diagnostics()[0];
+        let primary = diagnostic
+            .primary_span()
+            .as_source()
+            .unwrap()
+            .file_span()
+            .range();
+        let related = diagnostic.related()[0].span().file_span().range();
+        let start = source.find(pattern).unwrap();
+        for (span, binding) in [(primary, later), (related, first)] {
+            assert_eq!(
+                span.start().as_usize(),
+                start + pattern.find(binding).unwrap()
+            );
+            assert_eq!(
+                &source[span.start().as_usize()..span.end().as_usize()],
+                binding
+            );
+        }
+    }
+}
+
+#[test]
+fn owning_pattern_names_do_not_override_binding_or_shape_errors() {
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    for (pattern, expected) in [
+        ("whole @ Some(whole)", "PATTERN_DUPLICATE_BINDING"),
+        ("whole @ Some(first, second)", "PATTERN_ARITY_MISMATCH"),
+    ] {
+        let source =
+            format!("fn f(v: Opt[Own[i64]]) -> i64 = match move v {{ {pattern} => 0, None => 1 }}");
+        let mut compiler = session(&source);
+        compiler
+            .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+            .unwrap();
+        assert_eq!(
+            diagnostic_codes(&compiler.into_diagnostics(None)),
+            [expected],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn single_owning_bindings_and_ownership_free_aliases_remain_distinct() {
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    for source in [
+        "fn f(v: Opt[Own[i64]]) -> Opt[Own[i64]] = match move v { whole @ Some(_) => move whole, empty @ None => move empty }",
+        "fn f(v: Opt[Own[i64]]) -> Opt[Own[i64]] = match move v { Some(x) => Some(move x), None => None }",
+        "fn f(v: Res[Own[i64], Str]) -> Res[Own[i64], Str] = match move v { Ok(x) => Ok(move x), whole @ Err(reason) => move whole }",
+        "fn f(v: Opt[i64]) -> i64 = match v { whole @ Some(item) => item, None => 0 }",
+    ] {
+        let mut compiler = session(source);
+        let analysis = compiler
+            .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+            .unwrap();
+        let resolution = analysis.resolution().unwrap();
+        let function = resolution
+            .declarations()
+            .modules()
+            .flat_map(|m| m.declarations())
+            .find(|d| d.name().is_some_and(|name| name.text() == "f"))
+            .unwrap();
+        assert!(
+            matches!(
+                resolution.body_types().body(function.id()),
+                FactState::Known(_)
+            ),
+            "{source}"
+        );
+        assert!(
+            diagnostic_codes(&compiler.into_diagnostics(None)).is_empty(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn alias_canonicalization_preserves_pattern_diagnostic_precedence() {
     let catalog = TrustedCatalog::first_slice().unwrap();
     for (source, expected) in [

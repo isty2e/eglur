@@ -1866,6 +1866,23 @@ The primary span MUST identify the later introduction of the first duplicate
 on the first complete alternative path in source order.
 
 
+### `PATTERN_OWNERSHIP_BINDING_OVERLAP`
+
+Severity: `error`
+
+Trigger: on one complete alternative of a conditional-root match pattern, two
+different names bind the same ownership obligation. The primary span MUST
+identify the second owning name on the first offending alternative in source
+order. A related span SHOULD identify the first owning name.
+
+Message contract summary:
+
+1. `pattern`.
+2. `ownership`.
+3. `binding`.
+4. `overlap`.
+
+
 ### `LOOP_CONDITION_NOT_BOOL`
 
 Severity: `error`
@@ -3632,6 +3649,9 @@ Severity: `error`
 Trigger: for enabled ownership surface, a typed control-flow edge exits a
 lexical obligation region while a root belonging to that region is not
 definitely consumed after accounting for transfers through the edge.
+The same code applies when a typed exit leaves a consuming match during a
+guard that can still select a present ownership payload; see
+[Conditional Root Carriers](../language/ownership-boundary.md#conditional-root-carriers).
 
 This applies to bang and non-bang bodies, direct roots `Own[T]`, conditional roots `Opt[Own[T]]` / `Res[Own[T], E]`, and local roots introduced by fresh or moved ownership values.
 
@@ -3710,7 +3730,7 @@ Data contract summary (if `data` is present):
 
 Severity: `error`
 
-Trigger: an ownership-bearing value would be discarded or overwritten outside an allowed explicit discharge, including `_ = expr`, an unused expression statement, assignment over an existing root, or `_ = move x`.
+Trigger: an ownership-bearing value would be discarded or overwritten outside an allowed explicit discharge, including `_ = expr`, an unused expression statement, assignment over an existing root, or `_ = move x`. In a consuming match this includes an arm that can select a present owned payload without binding it or its carrier.
 
 Message contract summary:
 
@@ -3868,7 +3888,7 @@ Primary-span requirement:
 
 Severity: `error`
 
-Trigger: a `match` guard attempts to consume a tentative direct ownership-root binding through `move`, `drop_own`, or another by-value transfer before the arm is selected.
+Trigger: a `match` guard attempts to consume a tentative ownership binding (the carrier or its payload) through `move`, `drop_own`, or another by-value transfer before the arm is selected.
 
 Message contract summary:
 

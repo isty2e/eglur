@@ -1,5 +1,7 @@
 use super::{diagnostic_codes, session};
-use eglur_driver::{CompilerSession, SupportProfile, TrustedCatalog};
+use eglur_driver::{
+    CompilerSession, SupportProfile, SupportProfileId, SupportSchemaVersion, TrustedCatalog,
+};
 use eglur_sema::{CompileCapability, FactState, TypecheckCapability};
 
 fn check_branches(mut session: CompilerSession) {
@@ -17,6 +19,95 @@ fn check_branches(mut session: CompilerSession) {
         "{:?}",
         diagnostics.diagnostics()
     );
+}
+
+#[test]
+fn guards_without_a_normal_result_remove_only_matched_inputs() {
+    check_branches(session(concat!(
+        "fn stop() -> Never = stop()\n",
+        "fn test(_arg: i64) -> Bool = true\n",
+        "fn n() -> i64 = 2\n",
+        "fn all(x: Opt[i64]) -> Never = match x { _ if test(stop()) => n(), _ => n() }\n",
+        "fn both(x: Opt[i64]) -> Never = match x {\n",
+        "  Some(v) if test(stop()) => n(), None if test(stop()) => n(), _ => n() }\n",
+        "fn some(x: Opt[i64]) -> i64 = match x {\n",
+        "  Some(v) if test({ return 7 }) => n(), Some(v) => true, None => n() }\n",
+        "fn fallback(x: Res[i64, Str]) -> i64 = match x {\n",
+        "  Err(\"retry\") if test(stop()) => true, _ => n() }\n",
+    )));
+}
+
+#[test]
+fn stopping_in_a_guard_does_not_contribute_unconditional_coverage() {
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    let mut session = session(concat!(
+        "fn test(n: i64) -> Bool = true\n",
+        "fn choose(x: Opt[i64]) -> i64 = match x { _ if test({ return 7 }) => 1 }\n",
+    ));
+    session
+        .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+        .unwrap();
+    assert_eq!(
+        diagnostic_codes(&session.into_diagnostics(None)),
+        ["MATCH_NON_EXHAUSTIVE"]
+    );
+}
+
+#[test]
+fn invalid_written_guards_do_not_request_missing_carrier_coverage() {
+    let inhabitance = CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance);
+    let profile = SupportProfile::compile_only(
+        SupportSchemaVersion::V1,
+        SupportProfileId::new("without-inhabitance").unwrap(),
+        SupportProfile::semantic_core_v1()
+            .compile_capabilities()
+            .filter(|&c| c != inhabitance),
+    )
+    .unwrap();
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    for (guard, expected) in [("false", None), ("1", Some("MATCH_GUARD_TYPE_MISMATCH"))] {
+        let source = format!(
+            "fn f(x: Opt[Own[i64]]) -> i64 = match move x {{ None if {guard} => 0,\n\
+             Some(v) => {{ drop_own move v\nyield 1 }}, None => 2 }}\n"
+        );
+        let mut session = session(&source);
+        let analysis = session.resolve(&profile, Some(&catalog)).unwrap();
+        assert_eq!(
+            analysis
+                .trace()
+                .missing()
+                .any(|d| d.capability() == inhabitance),
+            expected.is_none(),
+            "{guard}"
+        );
+        assert_eq!(
+            diagnostic_codes(&session.into_diagnostics(None)),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn a_stopped_literal_guard_does_not_establish_a_later_result_type() {
+    let catalog = TrustedCatalog::first_slice().unwrap();
+    for literal in ["retry", "denied"] {
+        let source = format!(
+            "fn test(n: i64) -> Bool = true\nfn n() -> i64 = 1\n\
+            fn choose(x: Res[i64, Str]) -> i64 = match x {{\n\
+            Ok(v) => v, Err(\"retry\") if test({{ return 7 }}) => n(),\n\
+            Err(\"{literal}\") => true, Err(_) => n() }}\n"
+        );
+        let mut session = session(&source);
+        let analysis = session
+            .resolve(&SupportProfile::semantic_core_v1(), Some(&catalog))
+            .unwrap();
+        assert!(analysis.trace().missing().any(|d| d.capability()
+            == CompileCapability::Typecheck(TypecheckCapability::AnalyzePatternCoverage)));
+        assert_eq!(
+            diagnostic_codes(&session.into_diagnostics(None)),
+            Vec::<&str>::new()
+        );
+    }
 }
 
 #[test]

@@ -5,10 +5,10 @@ use eglur_driver::{
 };
 use eglur_sema::{DeclarationKind, FactState, OwnershipBodyStatus, PhaseProduct, SemanticLocation};
 
-const OWNERSHIP_MATCH: &str = concat!(
-    "fn discharge(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
-    "  None => { drop_own move root\nyield 0 },\n",
-    "  Some(value) => { drop_own move root\nyield value }\n",
+const OUTCOME_DEPENDENT_GUARD: &str = concat!(
+    "fn discharge(input: Opt[Own[i64]], side: Own[i64], flag: Bool) -> i64 = match move input {\n",
+    "  Some(v) if { yield if flag { drop_own move side\nyield false } else { yield true } } => { drop_own move side\ndrop_own move v\nyield 1 },\n",
+    "  Some(v) => { drop_own move v\nyield 2 }, None => { drop_own move side\nyield 0 }\n",
     "}\n",
 );
 
@@ -28,7 +28,7 @@ fn core_attempt(source: &str, limit: Option<ToolLimit>) -> CompileAttempt {
 #[test]
 fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() {
     let main = format!(
-        "{OWNERSHIP_MATCH}\
+        "{OUTCOME_DEPENDENT_GUARD}\
          fn balanced(root: Own[i64], flag: Bool) -> Unit {{\n\
            if flag {{ drop_own move root }} else {{ drop_own move root }}\n\
          }}\n\
@@ -44,6 +44,10 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
                     "fn make(n: i64) -> Own[i64] { return own n }\n",
                     "fn choose(input: Opt[i64]) -> Own[i64] = match input {\n",
                     "  None => make(1), Some(value) => make(value)\n",
+                    "}\n",
+                    "fn release(input: Res[Own[i64], Str], side: Own[i64], flag: Bool) -> Unit = match move input {\n",
+                    "  Err(_) if { yield if flag { drop_own move side\nyield false } else { yield true } } => { drop_own move side }, Err(_) => (),\n",
+                    "  Ok(value) => { drop_own move side\ndrop_own move value }\n",
                     "}\n",
                 )
                 .as_bytes()
@@ -72,7 +76,7 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
             .filter(|declaration| declaration.kind() == DeclarationKind::Function)
         {
             let name = declaration.name().unwrap().spelling();
-            let status = if matches!(name.as_str(), "discharge" | "choose") {
+            let status = if matches!(name.as_str(), "discharge" | "release") {
                 expected_locations.push(SemanticLocation::origin(
                     module.file(),
                     declaration.origin(),
@@ -106,7 +110,7 @@ fn incomplete_ownership_bodies_keep_individual_locations_and_checked_siblings() 
 
 #[test]
 fn ownership_gap_projects_as_unsupported_without_a_source_diagnostic() {
-    let source = format!("{OWNERSHIP_MATCH}fn main!() -> Unit = ()\n");
+    let source = format!("{OUTCOME_DEPENDENT_GUARD}fn main!() -> Unit = ()\n");
     let attempt = core_attempt(&source, None);
     assert_eq!(attempt.disposition(), CompileDisposition::Unsupported);
     assert!(matches!(
@@ -139,9 +143,53 @@ fn ownership_gap_projects_as_unsupported_without_a_source_diagnostic() {
 }
 
 #[test]
+fn coverage_error_does_not_hide_incomplete_ownership_in_the_same_body() {
+    let source = OUTCOME_DEPENDENT_GUARD.replace(", None => { drop_own move side\nyield 0 }", "");
+    let source = format!(
+        "{source}fn main!() -> Unit {{ let n = 0\nlet s = 1\n_ = discharge(Some(own n), own s, false) }}\n"
+    );
+    let attempt = core_attempt(&source, None);
+    let CompileAttempt::Unsupported(unsupported) = attempt else {
+        panic!("lost ownership disposition: {:?}", attempt.disposition());
+    };
+    assert_eq!(
+        diagnostic_codes(unsupported.diagnostics()),
+        ["MATCH_NON_EXHAUSTIVE"]
+    );
+    assert!(
+        unsupported
+            .trace()
+            .trace()
+            .missing()
+            .any(|d| d.capability().stable_key() == "typecheck.complete_ownership_flow")
+    );
+}
+
+#[test]
+fn guard_without_a_normal_result_does_not_certify_later_arms() {
+    let source = concat!(
+        "fn test(_arg: i64) -> Bool = true\n",
+        "fn take(v: Opt[Own[i64]]) -> Bool { drop_own move v\nreturn true }\n",
+        "fn choose(r: Opt[Own[i64]]) -> i64 = match move r {\n",
+        "  Some(x) => { drop_own move x\nyield 0 },\n",
+        "  whole if test({ return 7 }) => { drop_own move whole\nyield 1 },\n",
+        "  whole if take(move whole) => { drop_own move whole\nyield 2 },\n",
+        "  rest => { drop_own move rest\nyield 3 } }\n",
+        "fn main!() -> Unit = ()\n",
+    );
+    let CompileAttempt::Rejected(attempt) = core_attempt(source, None) else {
+        panic!("a written move of a tentative binding must be rejected");
+    };
+    assert_eq!(
+        attempt.errors().first_error().code().as_str(),
+        "OWNERSHIP_GUARD_CONSUME_FORBIDDEN"
+    );
+}
+
+#[test]
 fn unsupported_ownership_preserves_independent_errors_and_tool_limit_precedence() {
     let source = format!(
-        "{OWNERSHIP_MATCH}\
+        "{OUTCOME_DEPENDENT_GUARD}\
          fn bad(root: Own[i64]) -> i64 {{ return 0 }}\n\
          fn main!() -> Unit = ()\n"
     );

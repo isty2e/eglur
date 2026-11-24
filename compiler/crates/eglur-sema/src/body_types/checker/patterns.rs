@@ -17,23 +17,62 @@ mod poison_tests;
 mod tuple_tests;
 
 impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
-    pub(super) fn match_pattern_duplicate(
-        &self,
-        module: ModuleId,
-        body: &Body,
+    fn match_binding_error(
+        &mut self,
+        context: BodyContext<'_, '_>,
         root: PatternId,
-    ) -> Result<Option<(NameKey, OriginId)>, BodyFlow> {
-        let Some(duplicate) = self.pattern_bindings.duplicate(module, root) else {
-            return Ok(None);
-        };
-        let pattern = body
-            .pattern(duplicate.pattern)
-            .ok_or(BodyTypingError::WrongBodyPattern(duplicate.pattern))?;
-        let name = match pattern.kind() {
-            PatternKind::Binding(name) | PatternKind::Alias { name, .. } => name,
-            _ => return Err(BodyTypingError::InconsistentPatternBinding(duplicate.binding).into()),
-        };
-        Ok(NameKey::from_hir(name).map(|name| (name, duplicate.origin)))
+        overlap: Option<(OriginId, OriginId)>,
+    ) -> Result<Option<Poison>, BodyFlow> {
+        let source = context.source;
+        if let Some(duplicate) = self.pattern_bindings.duplicate(context.module, root) {
+            let pattern = context
+                .body
+                .pattern(duplicate.pattern)
+                .ok_or(BodyTypingError::WrongBodyPattern(duplicate.pattern))?;
+            let name = match pattern.kind() {
+                PatternKind::Binding(name) | PatternKind::Alias { name, .. } => name,
+                _ => {
+                    return Err(
+                        BodyTypingError::InconsistentPatternBinding(duplicate.binding).into(),
+                    );
+                }
+            };
+            if let Some(name) = NameKey::from_hir(name) {
+                return self
+                    .type_error(
+                        source,
+                        duplicate.origin,
+                        "PATTERN_DUPLICATE_BINDING",
+                        format!("pattern binding `{}` is duplicated", name.spelling()),
+                        BTreeMap::from([(
+                            Box::<str>::from("name"),
+                            DiagnosticDataValue::from(name.spelling()),
+                        )]),
+                    )
+                    .map(Some);
+            }
+        }
+        if let Some((first, later)) = overlap {
+            let span =
+                source
+                    .origin_span(first)
+                    .cloned()
+                    .ok_or(BodyTypingError::MissingOriginSpan {
+                        file: source.file(),
+                        origin: first,
+                    })?;
+            return self
+                .type_error_with_related(
+                    source,
+                    later,
+                    "PATTERN_OWNERSHIP_BINDING_OVERLAP",
+                    "overlapping ownership bindings in pattern: this root is already bound",
+                    RelatedSpan::new(span, "first ownership binding here"),
+                    BTreeMap::new(),
+                )
+                .map(Some);
+        }
+        Ok(None)
     }
 
     pub(super) fn install_match_bindings(

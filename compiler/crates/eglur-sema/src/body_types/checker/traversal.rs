@@ -377,8 +377,12 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                         expression,
                         request,
                         continuation,
+                        path,
                     } => {
                         pending.push(Step::ResumeBranch(continuation));
+                        if let Some(floor) = self.push_control_path_barrier(path) {
+                            pending.push(Step::Cleanup(Cleanup::PathBarrier(Some(floor))));
+                        }
                         pending.push(Step::Expression(expression, request));
                     }
                     BranchPlan::IfBranch {

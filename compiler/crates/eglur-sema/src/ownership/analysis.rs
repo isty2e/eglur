@@ -14,7 +14,8 @@ use crate::{
     TypecheckCapability,
 };
 
-use super::{OwnershipFacts, OwnershipFailure, analyze_body, emit_ownership_diagnostics};
+use super::body::{CoverageRecovery, OwnershipFindings};
+use super::{OwnershipFacts, analyze_body, emit_ownership_diagnostics};
 
 /// Performs the bounded ownership phase and emits at most one ownership error per callable.
 #[allow(
@@ -48,21 +49,14 @@ pub fn analyze_ownership(
         return Ok(recorder.finish(PhaseProduct::Unperformed));
     }
 
-    let (facts, failures) =
-        build_ownership_facts(collection, names, sources, signatures, body_types)?;
-
-    for module in collection.modules() {
-        for declaration in module.declarations() {
-            if let FactState::Known(summary) = facts.body(declaration.id())
-                && summary.status() == super::OwnershipBodyStatus::Unperformed
-            {
-                recorder.require(
-                    CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow),
-                    SemanticLocation::origin(module.file(), declaration.origin()),
-                );
-            }
-        }
-    }
+    let (facts, failures) = build_ownership_facts(
+        collection,
+        names,
+        sources,
+        signatures,
+        body_types,
+        &mut recorder,
+    )?;
 
     emit_ownership_diagnostics(&failures, collection, names, sources, diagnostics)?;
     Ok(recorder.finish(PhaseProduct::Performed(facts)))
@@ -75,7 +69,8 @@ fn build_ownership_facts(
     sources: &[SemanticSource<'_>],
     signatures: &DeclarationSignatures,
     body_types: &BodyTypes,
-) -> Result<(OwnershipFacts, Box<[OwnershipFailure]>), OwnershipAnalysisError> {
+    recorder: &mut DemandRecorder<'_>,
+) -> Result<(OwnershipFacts, Vec<OwnershipFindings>), OwnershipAnalysisError> {
     let mut source_map = BTreeMap::new();
     for source in sources {
         if source_map.insert(source.file(), source).is_some() {
@@ -119,25 +114,29 @@ fn build_ownership_facts(
         if signature.body().is_none() {
             continue;
         }
-        match body_types.body(declaration.id()) {
-            FactState::Known(_) => {}
-            FactState::Poisoned(poison) => {
+        let rejected_matches = body_types.rejected_coverage.body(declaration.id());
+        let recovery = match (body_types.body(declaration.id()), rejected_matches) {
+            (FactState::Known(_), _) => None,
+            (FactState::Poisoned(poison), Some(sites)) => {
+                Some(CoverageRecovery::new(poison, sites)?)
+            }
+            (FactState::Poisoned(poison), None) => {
                 facts
                     .bodies
                     .insert(declaration.id(), SemanticFact::Poisoned(poison.clone()))?;
                 continue;
             }
-            FactState::Unperformed => {
+            (FactState::Unperformed, _) => {
                 facts.complete = false;
                 continue;
             }
-            FactState::NotApplicable => {
+            (FactState::NotApplicable, _) => {
                 facts
                     .bodies
                     .insert(declaration.id(), SemanticFact::NotApplicable)?;
                 continue;
             }
-        }
+        };
 
         let module = collection.module(declaration.id().module()).ok_or(
             OwnershipAnalysisError::UnknownModule(declaration.id().module()),
@@ -174,15 +173,22 @@ fn build_ownership_facts(
             names,
             signatures,
             body_types,
+            recovery,
         )?;
-        facts.complete &= analysis.summary.status() == super::OwnershipBodyStatus::Checked;
-        failures.extend(analysis.failures);
-        facts
-            .bodies
-            .insert(declaration.id(), SemanticFact::Known(analysis.summary))?;
+        match analysis.findings {
+            Some(found) if !found.failures.is_empty() => failures.push(found),
+            Some(_) => {}
+            None => {
+                facts.complete = false;
+                recorder.require(
+                    CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow),
+                    SemanticLocation::origin(module.file(), declaration.origin()),
+                );
+            }
+        }
+        facts.bodies.insert(declaration.id(), analysis.fact)?;
     }
-    failures.sort_by_key(|failure| (failure.owner(), failure.origin()));
-    Ok((facts, failures.into_boxed_slice()))
+    Ok((facts, failures))
 }
 
 fn parameter_bindings(

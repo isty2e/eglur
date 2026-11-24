@@ -20,6 +20,15 @@ mod projection;
 #[path = "ownership/exit_regions.rs"]
 mod exit_regions;
 
+#[path = "ownership/carrier_guards.rs"]
+mod carrier_guards;
+
+#[path = "ownership/coverage.rs"]
+mod coverage;
+
+#[path = "ownership/match_arms.rs"]
+mod match_arms;
+
 fn body_capabilities() -> [CompileCapability; 14] {
     [
         CompileCapability::Resolve(ResolveCapability::CollectDeclarations),
@@ -761,7 +770,7 @@ fn ownership_phase_is_unperformed_when_the_capability_is_not_selected() {
 }
 
 #[test]
-fn unsupported_ownership_control_flow_keeps_checked_body_results() {
+fn checked_match_keeps_an_independent_ownership_error() {
     let mut session = session(concat!(
         "fn deferred(x: Own[i64], input: Opt[i64]) -> i64 = match input {\n",
         "  None => {\n",
@@ -785,8 +794,8 @@ fn unsupported_ownership_control_flow_keeps_checked_body_results() {
     let PhaseProduct::Performed(facts) = resolution.ownership_facts() else {
         panic!("checked ownership facts must remain observable");
     };
-    assert!(!facts.is_complete());
-    assert!(analysis.trace().missing().any(|entry| {
+    assert!(facts.is_complete());
+    assert!(!analysis.trace().missing().any(|entry| {
         entry.capability()
             == CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow)
     }));
@@ -797,7 +806,7 @@ fn unsupported_ownership_control_flow_keeps_checked_body_results() {
 }
 
 #[test]
-fn unsupported_match_returning_an_ownership_value_is_not_vacuously_checked() {
+fn match_can_return_a_fresh_ownership_value_from_either_arm() {
     let mut session = session(concat!(
         "fn make(n: i64) -> Own[i64] { return own n }\n",
         "fn choose(input: Opt[i64]) -> Own[i64] = match input {\n",
@@ -815,8 +824,8 @@ fn unsupported_match_returning_an_ownership_value_is_not_vacuously_checked() {
         panic!("ownership facts must remain observable");
     };
 
-    assert!(!facts.is_complete());
-    assert!(analysis.trace().missing().any(|entry| {
+    assert!(facts.is_complete());
+    assert!(!analysis.trace().missing().any(|entry| {
         entry.capability()
             == CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow)
     }));

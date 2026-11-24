@@ -234,6 +234,203 @@ tests:
     value:
       kind: Ok
       repr: '"ok"'
+- id: OWN-consuming-result-match-discharges-ok-and-retains-err-value
+  category: ownership
+  title: consuming a result discharges its Ok payload and preserves its Err value
+  code: |
+    import std::test::emit!
+
+    fn finish(v: Res[Own[i64], Str]) -> Str = match move v {
+      Ok(root) => {
+        drop_own move root
+        yield "released"
+      },
+      Err(reason) => reason
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(finish(Ok(own n)))
+      yield Ok(finish(Err("not opened")))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"not opened"'
+    side_effects:
+    - released
+- id: OWN-option-pattern-cannot-bind-both-carrier-and-payload
+  category: ownership
+  title: an unused owning binding still overlaps before the guard
+  code: |
+    fn consume(v: Opt[Own[i64]]) -> i64 = match move v {
+      whole @ Some(x) if false => { drop_own move x
+                                    yield 1 },
+      rest => { drop_own move rest
+                yield 0 }
+    }
+
+    fn main!() -> Res[Str, Str] = Ok("unused")
+  expect:
+    compile_error:
+      code: PATTERN_OWNERSHIP_BINDING_OVERLAP
+      message_contains:
+      - pattern
+      - binding
+      - ownership
+      - overlap
+      data_keys: []
+- id: OWN-result-pattern-cannot-bind-both-carrier-and-payload
+  category: ownership
+  title: binding the Ok carrier and its owned payload overlaps
+  code: |
+    fn consume(v: Res[Own[i64], Str]) -> i64 = match move v {
+      whole @ Ok(x) => { drop_own move whole
+                         yield 1 },
+      Err(_) => 0
+    }
+
+    fn main!() -> Res[Str, Str] = Ok("unused")
+  expect:
+    compile_error:
+      code: PATTERN_OWNERSHIP_BINDING_OVERLAP
+      message_contains:
+      - pattern
+      - binding
+      - ownership
+      - overlap
+      data_keys: []
+- id: OWN-match-may-keep-the-whole-carrier
+  category: ownership
+  title: a whole-carrier binding covers an unnamed owned payload
+  code: |
+    import std::test::emit!
+
+    fn release(v: Opt[Own[i64]]) -> i64 = match move v {
+      whole @ Some(_) => {
+        drop_own move whole
+        yield 1
+      },
+      empty @ None => {
+        drop_own move empty
+        yield 0
+      }
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(to_str(release(Some(own n))))
+      yield Ok(to_str(release(None)))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"0"'
+    side_effects:
+    - '1'
+- id: OWN-carrier-binding-is-independent-across-or-alternatives
+  category: ownership
+  title: exclusive alternatives may each bind the whole carrier once
+  code: |
+    fn release(r: Res[Own[i64], Str]) -> i64 = match move r {
+      (whole @ Ok(_)) | (whole @ Err(_)) => {
+        drop_own move whole
+        yield 1
+      }
+    }
+
+    fn main!() -> Res[Str, Str] = Ok(to_str(release(Err("empty"))))
+  expect:
+    value:
+      kind: Ok
+      repr: '"1"'
+- id: OWN-match-cannot-discard-an-unnamed-present-payload
+  category: ownership
+  title: a selected Some wildcard drops a present payload without a binding
+  code: |
+    fn lose(v: Opt[Own[i64]]) -> i64 = match move v {
+      Some(_) => 1,
+      None => 0
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(to_str(lose(Some(own n))))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
+- id: OWN-result-rest-cannot-discard-an-owned-ok-payload
+  category: ownership
+  title: Ok(..) matches the payload without acquiring it
+  code: |
+    fn lose(r: Res[Own[i64], Str]) -> Str = match move r {
+      Ok(..) => "lost",
+      Err(reason) => reason
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(lose(Ok(own n)))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
+- id: OWN-wildcard-after-unconditional-ok-can-only-select-err
+  category: ownership
+  title: a wildcard may follow an arm that takes every owned Ok payload
+  code: |
+    import std::test::emit!
+
+    fn release(r: Res[Own[i64], Str]) -> Str = match move r {
+      Ok(root) => { drop_own move root
+                    yield "released" },
+      _ => "empty"
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      emit!(release(Ok(own n)))
+      yield Ok(release(Err("failed")))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"empty"'
+    side_effects:
+    - released
+- id: OWN-wildcard-after-guarded-some-can-still-discard-a-payload
+  category: ownership
+  title: a false guard leaves the owned Some payload for the wildcard
+  code: |
+    fn release(v: Opt[Own[i64]], take: Bool) -> i64 = match move v {
+      Some(root) if take => { drop_own move root
+                              yield 1 },
+      _ => 0
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 3
+      yield Ok(to_str(release(Some(own n), false)))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_DISCARD_FORBIDDEN
+      message_contains:
+      - ownership
+      - discard
+      - forbidden
+      data_keys: []
 - id: OWN-move-free-match-arms-still-participate-in-global-ownership-discharge
   category: ownership
   title: move-free match arms still participate in function-region discharge
@@ -1544,6 +1741,8 @@ tests:
   category: ownership
   title: guard false preserves moved carrier payload for later arm
   code: |
+    import std::test::emit!
+
     fn consume_guarded(v: Opt[Own[i64]], first: Bool) -> i64 {
       match move v {
         Some(x) if first => {
@@ -1561,12 +1760,290 @@ tests:
     }
 
     fn main!() -> Res[Str, Str] {
-      yield Ok("ok")
+      let a: i64 = 7
+      let b: i64 = 8
+      let first = consume_guarded(Some(own a), true)
+      let fallback = consume_guarded(Some(own b), false)
+      let empty = consume_guarded(None, false)
+      emit!(to_str(first))
+      emit!(to_str(fallback))
+      yield Ok(to_str(empty))
     }
   expect:
     value:
       kind: Ok
-      repr: '"ok"'
+      repr: '"0"'
+    side_effects:
+    - '1'
+    - '2'
+- id: OWN-none-guard-return-precedes-whole-binding
+  category: ownership
+  title: returning from a None guard does not acquire its whole binding
+  code: |
+    import std::test::emit!
+
+    fn finish(v: Opt[Own[i64]], stop: Bool) -> Str = match move v {
+      whole @ None if {
+        if stop { return "before selection" }
+        yield true
+      } => {
+        drop_own move whole
+        yield "selected"
+      },
+      rest => {
+        drop_own move rest
+        yield "fallback"
+      }
+    }
+
+    fn main!() -> Res[Str, Str] {
+      emit!(finish(None, false))
+      yield Ok(finish(None, true))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"before selection"'
+    side_effects:
+    - selected
+- id: OWN-selected-none-whole-must-discharge-on-return
+  category: ownership
+  title: returning from a selected None arm must discharge its whole binding
+  code: |
+    fn finish(v: Opt[Own[i64]], take: Bool) -> Str = match move v {
+      whole @ None if take => {
+        return "selected" // @primary selected-whole-return
+      },
+      rest => {
+        drop_own move rest
+        yield "fallback"
+      }
+    }
+
+    fn main!() -> Res[Str, Str] = Ok(finish(None, true))
+  expect:
+    compile_error:
+      code: OWNERSHIP_PATH_UNBALANCED
+      message_contains:
+      - ownership
+      - path
+      - exactly once
+      data_keys: []
+      primary_span:
+        marker: selected-whole-return
+- id: OWN-guarded-ok-leaves-payload-at-catch-all-question
+  category: ownership
+  title: a false Ok guard leaves the payload pending at a catch-all guard's question mark
+  code: |
+    fn route(r: Res[Own[i64], Str], first: Bool, gate: Res[Bool, Str]) -> Res[Str, Str] = result {
+      let label: Str = match move r {
+        Ok(root) if first => {
+          drop_own move root
+          yield "first"
+        },
+        whole if {
+          let take = gate? // @primary catch-all-question
+          yield take
+        } => {
+          drop_own move whole
+          yield "second"
+        },
+        rest => {
+          drop_own move rest
+          yield "fallback"
+        }
+      }
+      yield Ok(label)
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 7
+      yield route(Ok(own n), false, Err("guard exit"))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_PATH_UNBALANCED
+      message_contains:
+      - ownership
+      - path
+      - exactly once
+      data_keys: []
+      primary_span:
+        marker: catch-all-question
+- id: OWN-unconditional-ok-allows-catch-all-question
+  category: ownership
+  title: after an unconditional Ok arm only Err can reach the catch-all guard's question mark
+  code: |
+    fn route(r: Res[Own[i64], Str], gate: Res[Bool, Str]) -> Res[Str, Str] = result {
+      let label: Str = match move r {
+        Ok(root) => {
+          drop_own move root
+          yield "first"
+        },
+        whole if gate? => {
+          drop_own move whole
+          yield "second"
+        },
+        rest => {
+          drop_own move rest
+          yield "fallback"
+        }
+      }
+      yield Ok(label)
+    }
+
+    fn main!() -> Res[Str, Str] = route(Err("input error"), Err("guard exit"))
+  expect:
+    value:
+      kind: Err
+      repr: '"guard exit"'
+- id: OWN-checked-fault-crosses-pending-some
+  category: ownership
+  title: a checked overflow in a Some guard exits with the payload still pending
+  code: |
+    fn finish(v: Opt[Own[i64]], value: i8) -> Res[Str, NumericError] = checked {
+      yield match move v {
+        Some(root) if {
+          let doubled: i8 = value + value // @primary guard-overflow
+          yield match doubled { 0 => true, _ => false }
+        } => {
+          drop_own move root
+          yield "first"
+        },
+        rest => {
+          drop_own move rest
+          yield "fallback"
+        }
+      }
+    }
+
+    fn main!() -> Res[Str, NumericError] {
+      let n: i64 = 7
+      yield finish(Some(own n), 64)
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_PATH_UNBALANCED
+      message_contains:
+      - ownership
+      - path
+      - exactly once
+      data_keys: []
+      primary_span:
+        marker: guard-overflow
+- id: OWN-guard-local-result-and-checked-exits-preserve-carrier
+  category: ownership
+  title: a question exit and a checked fault caught inside the guard leave Some for the next arm
+  code: |
+    fn retained(v: Opt[Own[i64]], gate: Res[Bool, Str], value: i8) -> Bool = match move v {
+      Some(root) if {
+        let decision: Res[Bool, Str] = result {
+          let take = gate?
+          yield Ok(take)
+        }
+        let doubled: Res[i8, NumericError] = checked { yield value + value }
+        yield match decision {
+          Ok(_) => true,
+          Err(_) => match doubled { Ok(_) => true, Err(_) => false }
+        }
+      } => {
+        drop_own move root
+        yield false
+      },
+      whole => {
+        drop_own move whole
+        yield true
+      }
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 7
+      yield Ok(to_str(retained(Some(own n), Err("stop"), 64)))
+    }
+  expect:
+    value:
+      kind: Ok
+      repr: '"true"'
+- id: OWN-inner-none-guard-return-crosses-outer-ok
+  category: ownership
+  title: returning from the inner None guard still crosses the outer pending Ok payload
+  code: |
+    fn empty() -> Opt[Own[i64]] = None
+
+    fn finish(r: Res[Own[i64], Str], stop: Bool) -> Str = match move r {
+      Ok(outer) if {
+        yield match empty() {
+          None if {
+            if stop {
+              return "escaped" // @primary nested-guard-return
+            }
+            yield true
+          } => true,
+          None => false,
+          Some(inner) => {
+            drop_own move inner
+            yield false
+          }
+        }
+      } => {
+        drop_own move outer
+        yield "selected"
+      },
+      rest => {
+        drop_own move rest
+        yield "fallback"
+      }
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 7
+      yield Ok(finish(Ok(own n), true))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_PATH_UNBALANCED
+      message_contains:
+      - ownership
+      - path
+      - exactly once
+      data_keys: []
+      primary_span:
+        marker: nested-guard-return
+- id: OWN-err-guard-return-still-checks-ordinary-root
+  category: ownership
+  title: returning from an Err guard must still discharge an independent function root
+  code: |
+    fn finish(r: Res[Own[i64], Str], other: Own[i64], stop: Bool) -> Str {
+      let label: Str = match move r {
+        Err(reason) if {
+          if stop {
+            return reason // @primary ordinary-root-return
+          }
+          yield true
+        } => reason,
+        rest => {
+          drop_own move rest
+          yield "fallback"
+        }
+      }
+      drop_own move other
+      yield label
+    }
+
+    fn main!() -> Res[Str, Str] {
+      let n: i64 = 7
+      yield Ok(finish(Err("empty"), own n, true))
+    }
+  expect:
+    compile_error:
+      code: OWNERSHIP_PATH_UNBALANCED
+      message_contains:
+      - ownership
+      - path
+      - exactly once
+      data_keys: []
+      primary_span:
+        marker: ordinary-root-return
 - id: OWN-guard-may-shared-borrow-tentative-root
   category: ownership
   title: guard may shared-borrow tentative root

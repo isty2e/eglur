@@ -1,5 +1,10 @@
 use super::*;
 
+mod search;
+use search::ArmSearch;
+pub(super) use search::Coverage;
+pub(super) use search::MatchDomain;
+
 #[cfg(test)]
 mod poison_tests;
 
@@ -9,6 +14,7 @@ pub(super) enum BranchPlan {
         expression: ExprId,
         request: TypeRequest,
         continuation: BranchContinuation,
+        path: NormalContinuation,
     },
     IfBranch {
         region: ControlRegionKey,
@@ -96,7 +102,9 @@ pub(super) struct MatchFrame {
     scrutinee_continuation: NormalContinuation,
     common: Option<TypeId>,
     any_normal_arm: bool,
-    coverage: Vec<(usize, PatternCoverage)>,
+    patterns: Vec<PatternCheck>,
+    search: Option<ArmSearch>,
+    entries: Vec<NormalContinuation>,
     poison: PendingPoison,
     unperformed: bool,
     deferred: bool,
@@ -139,6 +147,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             return BranchPlan::Complete(Outcome::Unperformed);
         }
         BranchPlan::Expression {
+            path: NormalContinuation::Present,
             expression: expression.condition,
             request: TypeRequest::definitive(None),
             continuation: BranchContinuation::IfCondition {
@@ -170,6 +179,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             return BranchPlan::Complete(Outcome::Unperformed);
         }
         BranchPlan::Expression {
+            path: NormalContinuation::Present,
             expression: expression.scrutinee,
             request: TypeRequest::definitive(None),
             continuation: if expression.arms.is_empty() {
@@ -411,7 +421,9 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     ) -> Result<BranchPlan, BodyFlow> {
         let mut frame = Box::new(MatchFrame {
             owner,
-            coverage: Vec::with_capacity(expression.arms.len()),
+            patterns: Vec::with_capacity(expression.arms.len()),
+            entries: Vec::with_capacity(expression.arms.len()),
+            search: None,
             expression,
             request,
             next_arm: 0,
@@ -427,6 +439,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Outcome::Known(value) => {
                 frame.scrutinee_type = Some(value.ty);
                 frame.scrutinee_continuation = value.normal_continuation;
+                frame.search = self.match_domain(value.ty)?.map(ArmSearch::new);
             }
             Outcome::Poisoned(found) => frame.poison.include(&found)?,
             Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
@@ -447,22 +460,67 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 frame,
             });
         }
-        if !frame.poison.has_poison()
+        let validate = !frame.poison.has_poison() && !frame.unperformed && !frame.deferred;
+        if validate && frame.search.as_ref().is_none_or(|s| s.domain.carrier) {
+            let origin = self.pattern_origin(source, frame.expression.arms[0].pattern)?;
+            if !self.recorder.require(
+                CompileCapability::Typecheck(TypecheckCapability::AnalyzeInhabitance),
+                SemanticLocation::origin(source.file(), origin),
+            ) {
+                return Ok(BranchPlan::Complete(Outcome::Unperformed));
+            }
+        }
+        // A nested coverage failure can still need its enclosing pattern and guard bindings.
+        let recovering = self
+            .current_owner
+            .is_some_and(|owner| self.rejected_coverage.body(owner).is_some());
+        if (validate || recovering)
             && !frame.unperformed
             && !frame.deferred
-            && let Some(expected) = frame.scrutinee_type
+            && frame.patterns.len() == frame.expression.arms.len()
+            && let Some(search) = &frame.search
         {
-            let coverage = frame
-                .coverage
-                .into_iter()
-                .map(|(index, coverage)| (&frame.expression.arms[index], coverage))
-                .collect::<Vec<_>>();
-            match self.check_match_coverage(source, expected, &coverage)? {
-                Outcome::Known(()) => {}
-                Outcome::Poisoned(found) => frame.poison.include(&found)?,
-                Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
-                Outcome::Deferred => frame.deferred = true,
+            let checked = search
+                .domain
+                .check_patterns(&frame.expression.arms, &frame.patterns);
+            if validate {
+                match self.validate_match_coverage(
+                    source,
+                    frame.expression.arms[0].pattern,
+                    checked.coverage,
+                )? {
+                    Outcome::Known(()) => {}
+                    Outcome::Poisoned(failure) => {
+                        frame.poison.include(&failure)?;
+                        if let Some(owner) = self.current_owner {
+                            self.rejected_coverage
+                                .record(owner, frame.owner.expression(), failure);
+                        }
+                    }
+                    Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
+                    Outcome::Deferred => frame.deferred = true,
+                }
             }
+            if !frame.unperformed && !frame.deferred {
+                let facts = frame
+                    .entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, entry)| MatchArmControl {
+                        entry,
+                        carrier: checked.carriers.as_ref().map(|carriers| carriers[i]),
+                    })
+                    .collect::<Box<[_]>>();
+                if let Some(existing) = self.match_arms.get(&frame.owner) {
+                    if *existing != facts {
+                        return Err(DuplicateFact.into());
+                    }
+                } else {
+                    self.match_arms.insert(frame.owner, facts);
+                }
+            }
+        } else if validate {
+            frame.unperformed = true;
         }
         if let Some(poison) = frame.poison.take() {
             return Ok(BranchPlan::Complete(Outcome::Poisoned(poison)));
@@ -494,39 +552,37 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         context: BodyContext<'_, '_>,
         mut frame: Box<MatchFrame>,
     ) -> Result<BranchPlan, BodyFlow> {
-        let BodyContext {
-            module,
-            source,
-            body,
-            ..
-        } = context;
+        let BodyContext { module, body, .. } = context;
         let arm = &frame.expression.arms[frame.next_arm];
         let pattern = if let Some(expected) = frame.scrutinee_type {
             self.type_match_pattern(context, arm.pattern, expected)?
         } else {
             Outcome::Unperformed
         };
+        // Missing input cannot prove an arm dead; independent arm type errors still count.
+        let mut entry = if frame.scrutinee_type.is_some() {
+            frame.scrutinee_continuation
+        } else {
+            NormalContinuation::Present
+        };
         match pattern {
             Outcome::Known(pattern) => {
-                if let Some((name, duplicate_origin)) =
-                    self.match_pattern_duplicate(module, body, arm.pattern)?
-                {
-                    let found = self.type_error(
-                        source,
-                        duplicate_origin,
-                        "PATTERN_DUPLICATE_BINDING",
-                        format!("pattern binding `{}` is duplicated", name.spelling()),
-                        BTreeMap::from([(
-                            Box::<str>::from("name"),
-                            DiagnosticDataValue::from(name.spelling()),
-                        )]),
-                    )?;
-                    self.bind_pattern_poison(module, body, arm.pattern, found.clone())?;
-                    frame.poison.include(&found)?;
-                } else {
-                    self.install_match_bindings(module, arm.pattern)?;
-                    frame.coverage.push((frame.next_arm, pattern.coverage));
+                self.install_match_bindings(module, arm.pattern)?;
+                if let Some(search) = &mut frame.search {
+                    entry = entry.strict(search.enter(&pattern));
+                    if entry.is_present() && search.uncertain_entry() {
+                        self.demand_unimplemented(
+                            TypecheckCapability::AnalyzePatternCoverage,
+                            context.source,
+                            self.pattern_origin(context.source, arm.pattern)?,
+                        );
+                        frame.unperformed = true;
+                    }
+                    if arm.guard.is_none() {
+                        search.keep_misses();
+                    }
                 }
+                frame.patterns.push(pattern);
             }
             Outcome::Poisoned(found) => {
                 self.bind_pattern_poison(module, body, arm.pattern, found.clone())?;
@@ -535,15 +591,17 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Outcome::Unperformed | Outcome::NotApplicable => frame.unperformed = true,
             Outcome::Deferred => frame.deferred = true,
         }
+        frame.entries.push(entry);
         if let Some(guard) = &arm.guard {
             let bool_ty = self.primitive(PrimitiveType::Bool)?;
             return Ok(BranchPlan::Expression {
                 expression: guard.condition,
                 request: TypeRequest::local(Some(bool_ty)),
                 continuation: BranchContinuation::MatchGuard { frame, bool_ty },
+                path: entry,
             });
         }
-        Ok(frame.body_plan(NormalContinuation::Present))
+        Ok(frame.body_plan(entry))
     }
 
     fn resume_match_guard(
@@ -579,7 +637,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     )?;
                     frame.poison.include(&found)?;
                 }
-                value.normal_continuation
+                if value.ty == bool_ty
+                    && !value.normal_continuation.is_present()
+                    && let Some(search) = &mut frame.search
+                {
+                    search.stop_matched();
+                }
+                frame.entries[frame.next_arm].strict(value.normal_continuation)
             }
             Outcome::Poisoned(found) => {
                 frame.poison.include(&found)?;
@@ -616,7 +680,12 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     ) -> Result<BranchPlan, BodyFlow> {
         match outcome {
             Outcome::Known(value)
-                if !guard_continuation.is_present() || !value.normal_continuation.is_present() => {}
+                if !guard_continuation.is_present()
+                    || !value.normal_continuation.is_present()
+                    || frame
+                        .search
+                        .as_ref()
+                        .is_some_and(ArmSearch::uncertain_entry) => {}
             Outcome::Known(value) => {
                 frame.any_normal_arm = true;
                 if let Some(left) = frame.common {

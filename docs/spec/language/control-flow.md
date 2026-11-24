@@ -226,7 +226,9 @@ Structural pattern validation:
     8. duplicate binding on the first complete alternative path in source
        order,
     9. or-pattern binding-set/type mismatch,
-    10. exhaustiveness and reachability analysis.
+    10. overlapping ownership bindings on one complete alternative of a
+        conditional-root pattern (`PATTERN_OWNERSHIP_BINDING_OVERLAP`),
+    11. exhaustiveness and reachability analysis.
     Within Rules 10.6 and 10.8, the later occurrence of the first duplicate in
     source order is primary. For a missing field, the first omitted declaration
     field is primary and the enclosing explicit pattern head, or the opening
@@ -246,12 +248,17 @@ When ownership surface is enabled, `match` ownership-path analysis MUST addition
 
 1. guard-true and guard-false path splits are distinct typed paths for ownership accounting,
 2. typed exits from selected arm expressions are included in ownership discharge analysis,
-3. function-level typed exits through every arm are included.
+3. function-level typed exits through every arm are included,
+4. a typed exit that leaves a consuming match during guard evaluation follows
+   [Conditional Root Carriers](ownership-boundary.md#conditional-root-carriers).
 
 Patterns do not consume ownership by themselves in v0.1.
 An ownership-bearing scrutinee must be transferred before decomposition: use `match move r { ... }` for a named conditional root.
-Bindings introduced by the selected `Some`/`Ok` arm then become direct roots under `ownership-boundary.md`.
-For guarded ownership-carrier arms, bindings remain tentative during guard evaluation. A guard may use a tentative root only through a non-escaping shared borrow; consuming it fails with `OWNERSHIP_GUARD_CONSUME_FORBIDDEN`. Guard-false continuation preserves the moved carrier payload for later arms, and only the selected arm acquires the direct root.
+The selected arm can bind the whole carrier or its owned payload, as specified
+in [Conditional Root Carriers](ownership-boundary.md#conditional-root-carriers).
+During guard evaluation the binding is tentative: only a non-escaping shared
+borrow is permitted (`OWNERSHIP_GUARD_CONSUME_FORBIDDEN` on a consuming use).
+If the guard fails, the moved carrier remains available for later arms.
 
 
 ### Block Expressions and `yield`

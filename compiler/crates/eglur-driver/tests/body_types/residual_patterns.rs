@@ -133,7 +133,7 @@ fn unavailable_residual_head_resolution_cannot_seal_a_checked_program() {
 }
 
 #[test]
-fn residual_match_arms_retain_the_existing_ownership_flow_gap() {
+fn a_resolved_residual_head_is_not_an_ownership_binding() {
     let catalog = TrustedCatalog::first_slice().unwrap();
     let mut session = session(concat!(
         "fn discharge(input: Opt[i64], root: Own[i64]) -> i64 = match input {\n",
@@ -148,7 +148,7 @@ fn residual_match_arms_retain_the_existing_ownership_flow_gap() {
     let PhaseProduct::Performed(facts) = resolution.ownership_facts() else {
         panic!("ownership analysis must run");
     };
-    assert!(!facts.is_complete());
+    assert!(facts.is_complete());
     assert!(
         resolution
             .names()
@@ -156,12 +156,9 @@ fn residual_match_arms_retain_the_existing_ownership_flow_gap() {
             .iter()
             .all(|local| local.name().text() != "None")
     );
-    assert!(analysis.trace().missing().any(|entry| {
-        entry.capability()
-            == CompileCapability::Typecheck(TypecheckCapability::CheckCompleteOwnershipFlow)
-    }));
+    assert!(analysis.trace().missing().next().is_none());
     let sealed = session.seal(None).unwrap();
-    assert!(sealed.checked_program().is_none());
+    assert!(sealed.checked_program().is_some());
     assert!(diagnostic_codes(sealed.diagnostics()).is_empty());
 }
 

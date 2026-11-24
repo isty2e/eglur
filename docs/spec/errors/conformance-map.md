@@ -608,13 +608,16 @@ Tensor determinism coverage additionally requires:
    11. use/borrow of a non-definitely-owned root, any local reference copy/merge derived from such a root, or a source consumed by `own` requires `OWNERSHIP_USE_AFTER_DISCHARGE`;
    12. ownership analysis enforces path-sensitive merge (`Owned`/`Consumed`/`MaybeConsumed`) and rejects `MaybeConsumed` at ownership-use sites;
    13. ownership diagnostics use the explicit one-primary-per-failing-function override in `../language/ownership-boundary.md`; same-class candidates select the earliest canonical source location rather than analysis traversal order, and implementations SHOULD attach additional distinct cause locations via `related` notes/spans;
-   14. guarded `match` arms require both guard-true and guard-false ownership path coverage without transferring a tentative payload to a rejected arm;
+   14. guarded `match` arms require both guard-true and guard-false ownership path coverage without transferring a tentative payload to a rejected arm; a typed exit leaving a guard with a possible present payload requires `OWNERSHIP_PATH_UNBALANCED`;
    15. conditional carriers require `(move r)?` or `match move r` for named roots and introduce a direct root only on `Some`/`Ok` paths;
    16. generic containers and callable values, including closure and partial-application capture environments, remain ownership-free in v0.1;
    17. consuming a tentative ownership binding in a match guard requires `OWNERSHIP_GUARD_CONSUME_FORBIDDEN`, while a shared guard borrow remains valid;
    18. `Own[T]` does not generally forward methods from `T` or implement `Clone`; cloning a root requires `METHOD_NOT_FOUND`, while designated resource methods resolve only on their explicit `Own[R]` wrapper types.
    19. associated type bindings remain ownership-free and reject direct or conditional-carrier ownership bindings with `OWNERSHIP_TYPE_POSITION_FORBIDDEN`; an alias that hides an ownership root is already rejected at its alias declaration and is not claimed as a distinct associated-binding path.
    20. ownership-position validation remains primary when an `Own[...]` payload, generic argument, or associated binding also violates the reference-free abstraction-slot rule.
+   21. two owning bindings on one alternative of a conditional-root match
+       pattern require `PATTERN_OWNERSHIP_BINDING_OVERLAP`; one owning binding
+       may coexist with ownership-free bindings.
 28. Implementations MAY expose non-baseline ownership-disabled mode; if such mode is tested, ownership syntax/type-surface paths (including `Own[...]`) require `OWNERSHIP_PROFILE_DISABLED`.
 29. `CAPABILITY_*` diagnostics are extension-profile codes and are outside required v0.1 conformance unless capability features are explicitly enabled.
 30. ADT baseline suites require:

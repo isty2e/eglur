@@ -1,5 +1,24 @@
 use super::*;
 
+#[derive(Default)]
+struct CarrierBindings {
+    enclosing: Option<OriginId>,
+    overlap: Option<(OriginId, OriginId)>,
+}
+
+impl CarrierBindings {
+    fn bind(&mut self, origin: OriginId) {
+        if let Some(first) = self.enclosing {
+            self.overlap.get_or_insert((first, origin));
+        }
+    }
+
+    fn enter_alias(&mut self, origin: OriginId) -> Option<OriginId> {
+        self.bind(origin);
+        self.enclosing.replace(origin)
+    }
+}
+
 enum PatternPlan<'hir> {
     Complete(Outcome<PatternCheck>),
     Child {
@@ -13,6 +32,7 @@ enum PatternContinuation<'hir> {
     Alias {
         binding: LocalBindingId,
         expected: TypeId,
+        enclosing: Option<OriginId>,
     },
     Group,
     Tuple {
@@ -72,10 +92,16 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             .pattern(pattern_id)
             .ok_or(BodyTypingError::WrongBodyPattern(pattern_id))?;
         self.pattern_bindings.begin(context.module, pattern_id);
+        let mut owners = matches!(
+            self.signatures.types().ownership_root(expected)?,
+            Some(crate::OwnershipRoot::Optional { .. } | crate::OwnershipRoot::Result { .. })
+        )
+        .then(CarrierBindings::default);
         let mut pending = (pattern_id, expected);
         let mut continuations = Vec::new();
         loop {
-            let mut plan = self.prepare_match_pattern(context, pending.0, pending.1)?;
+            let mut plan =
+                self.prepare_match_pattern(context, pending.0, pending.1, owners.as_mut())?;
             loop {
                 match plan {
                     PatternPlan::Child {
@@ -89,9 +115,18 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                     }
                     PatternPlan::Complete(outcome) => {
                         let Some(continuation) = continuations.pop() else {
+                            if matches!(outcome, Outcome::Known(_))
+                                && let Some(poison) = self.match_binding_error(
+                                    context,
+                                    pattern_id,
+                                    owners.and_then(|b| b.overlap),
+                                )?
+                            {
+                                return Ok(Outcome::Poisoned(poison));
+                            }
                             return Ok(outcome);
                         };
-                        plan = self.resume_match_pattern(continuation, outcome)?;
+                        plan = self.resume_match_pattern(continuation, outcome, owners.as_mut())?;
                     }
                 }
             }
@@ -103,6 +138,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         context: BodyContext<'_, 'body>,
         pattern_id: PatternId,
         expected: TypeId,
+        owners: Option<&mut CarrierBindings>,
     ) -> Result<PatternPlan<'body>, BodyFlow> {
         let BodyContext {
             module,
@@ -160,8 +196,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 self.pattern_bindings
                     .observe(binding, pattern_id, name.origin())?;
                 self.pattern_bindings.type_binding(binding, expected)?;
+                if let Some(owners) = owners
+                    && self.signatures.types().ownership_root(expected)?.is_some()
+                {
+                    owners.bind(name.origin());
+                }
                 Ok(PatternPlan::Complete(Outcome::Known(
-                    PatternCheck::irrefutable(),
+                    PatternCheck::irrefutable().bind_whole(binding),
                 )))
             }
             PatternKind::Wildcard => Ok(PatternPlan::Complete(Outcome::Known(
@@ -176,10 +217,21 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 )?;
                 self.pattern_bindings
                     .observe(binding, pattern_id, name.origin())?;
+                let enclosing = match owners {
+                    Some(owners) if self.signatures.types().ownership_root(expected)?.is_some() => {
+                        owners.enter_alias(name.origin())
+                    }
+                    Some(owners) => owners.enclosing,
+                    None => None,
+                };
                 Ok(PatternPlan::Child {
                     pattern: *pattern,
                     expected,
-                    continuation: PatternContinuation::Alias { binding, expected },
+                    continuation: PatternContinuation::Alias {
+                        binding,
+                        expected,
+                        enclosing,
+                    },
                 })
             }
             PatternKind::Group(pattern) => Ok(PatternPlan::Child {
@@ -500,13 +552,23 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         &mut self,
         continuation: PatternContinuation<'body>,
         outcome: Outcome<PatternCheck>,
+        owners: Option<&mut CarrierBindings>,
     ) -> Result<PatternPlan<'body>, BodyFlow> {
         match continuation {
-            PatternContinuation::Alias { binding, expected } => {
+            PatternContinuation::Alias {
+                binding,
+                expected,
+                enclosing,
+            } => {
+                if let Some(owners) = owners {
+                    owners.enclosing = enclosing;
+                }
                 if let Outcome::Known(_) = &outcome {
                     self.pattern_bindings.type_binding(binding, expected)?;
                 }
-                Ok(PatternPlan::Complete(outcome))
+                Ok(PatternPlan::Complete(
+                    outcome.map(|check| check.bind_whole(binding)),
+                ))
             }
             PatternContinuation::Group => Ok(PatternPlan::Complete(outcome)),
             PatternContinuation::Tuple {
@@ -542,12 +604,18 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
                 let Outcome::Known(child) = outcome else {
                     return Ok(PatternPlan::Complete(outcome));
                 };
+                let payload_binding = match child.binding {
+                    Some(RootPatternBinding::Whole(id)) if templates.len() == 1 => {
+                        Some(RootPatternBinding::Payload(id))
+                    }
+                    _ => None,
+                };
                 check.merge(child);
 
                 let Some((pattern, type_index)) = cursor.next(templates.len()) else {
-                    return Ok(PatternPlan::Complete(Outcome::Known(
-                        PatternCheck::variant(declaration, check),
-                    )));
+                    let mut variant = PatternCheck::variant(declaration, check);
+                    variant.binding = payload_binding;
+                    return Ok(PatternPlan::Complete(Outcome::Known(variant)));
                 };
                 let expected = self
                     .signatures
@@ -610,62 +678,68 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         )
     }
 
-    pub(in super::super) fn check_match_coverage(
+    pub(in super::super) fn match_domain(
+        &mut self,
+        scrutinee: TypeId,
+    ) -> Result<Option<branching::MatchDomain>, BodyFlow> {
+        let payloads = match self.signatures.types().ownership_root(scrutinee)? {
+            Some(crate::OwnershipRoot::Optional { payload }) => Some([Some(payload), None]),
+            Some(crate::OwnershipRoot::Result { payload, error }) => {
+                Some([Some(payload), Some(error)])
+            }
+            _ => None,
+        };
+        let mut impossible = [false; 2];
+        if let Some(payloads) = payloads {
+            if !self.recorder.supports(CompileCapability::Typecheck(
+                TypecheckCapability::AnalyzeInhabitance,
+            )) {
+                return Ok(None);
+            }
+            for (impossible, payload) in impossible.iter_mut().zip(payloads) {
+                if let Some(ty) = payload {
+                    *impossible =
+                        self.inhabitance.classify(self.signatures, ty)? == Inhabitance::Uninhabited;
+                }
+            }
+        }
+
+        Ok(Some(branching::MatchDomain {
+            constructors: self
+                .match_variant_universe(scrutinee)?
+                .map(|roles| roles.map(Clone::clone)),
+            impossible,
+            carrier: payloads.is_some(),
+        }))
+    }
+
+    pub(in super::super) fn validate_match_coverage(
         &mut self,
         source: &SemanticSource<'_>,
-        scrutinee: TypeId,
-        arms: &[(&eglur_hir::MatchArm, PatternCoverage)],
+        first: PatternId,
+        coverage: branching::Coverage,
     ) -> Result<Outcome<()>, BodyFlow> {
-        let mut total = false;
-        let mut variants = BTreeSet::new();
-        for (arm, coverage) in arms {
-            let unreachable = total
-                || (!coverage.variants.is_empty()
-                    && coverage
-                        .variants
-                        .iter()
-                        .all(|variant| variants.contains(variant)));
-            if unreachable {
-                return self
-                    .type_error(
-                        source,
-                        self.pattern_origin(source, arm.pattern)?,
-                        "MATCH_UNREACHABLE_ARM",
-                        "match arm is unreachable",
-                        BTreeMap::new(),
-                    )
-                    .map(Outcome::Poisoned);
+        use branching::Coverage;
+        let (pattern, code, message) = match coverage {
+            Coverage::Exhaustive => return Ok(Outcome::Known(())),
+            Coverage::Unreachable(pattern) => {
+                (pattern, "MATCH_UNREACHABLE_ARM", "match arm is unreachable")
             }
-            if arm.guard.is_none() {
-                total |= coverage.total;
-                variants.extend(coverage.variants.iter().cloned());
+            Coverage::MissingVariant => (first, "MATCH_NON_EXHAUSTIVE", "match is non-exhaustive"),
+            Coverage::Unknown => {
+                self.demand_unimplemented(
+                    TypecheckCapability::AnalyzePatternCoverage,
+                    source,
+                    self.pattern_origin(source, first)?,
+                );
+                return Ok(Outcome::Unperformed);
             }
-        }
-        if total {
-            return Ok(Outcome::Known(()));
-        }
-        let Some(universe) = self.match_variant_universe(scrutinee)? else {
-            let origin = arms
-                .first()
-                .map(|(arm, _)| self.pattern_origin(source, arm.pattern))
-                .transpose()?
-                .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
-            self.demand_unimplemented(TypecheckCapability::AnalyzePatternCoverage, source, origin);
-            return Ok(Outcome::Unperformed);
         };
-        if universe.iter().all(|variant| variants.contains(variant)) {
-            return Ok(Outcome::Known(()));
-        }
-        let origin = arms
-            .first()
-            .map(|(arm, _)| self.pattern_origin(source, arm.pattern))
-            .transpose()?
-            .ok_or(BodyTypingError::MissingMatchCoverageOrigin)?;
         self.type_error(
             source,
-            origin,
-            "MATCH_NON_EXHAUSTIVE",
-            "match is non-exhaustive",
+            self.pattern_origin(source, pattern)?,
+            code,
+            message,
             BTreeMap::new(),
         )
         .map(Outcome::Poisoned)
@@ -674,14 +748,13 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
     fn match_variant_universe(
         &self,
         scrutinee: TypeId,
-    ) -> Result<Option<BTreeSet<CanonicalTarget>>, BodyFlow> {
+    ) -> Result<Option<[&CanonicalTarget; 2]>, BodyFlow> {
         let TypeKind::Nominal { head, .. } = self.signatures.types().kind(scrutinee)? else {
             return Ok(None);
         };
-        let intrinsic = |left: LanguageItem, right: LanguageItem| {
-            let left = self.signatures.language_items().declaration(left)?.clone();
-            let right = self.signatures.language_items().declaration(right)?.clone();
-            Some(BTreeSet::from([left, right]))
+        let intrinsic = |present, absent| {
+            let items = self.signatures.language_items();
+            Some([items.declaration(present)?, items.declaration(absent)?])
         };
         let variants = match head {
             NominalHead::Intrinsic(IntrinsicNominal::Opt) => {
@@ -696,7 +769,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
         Ok(variants)
     }
 
-    fn pattern_origin(
+    pub(in super::super) fn pattern_origin(
         &self,
         source: &SemanticSource<'_>,
         pattern: PatternId,

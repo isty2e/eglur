@@ -25,6 +25,8 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             regions: self.regions,
             checked_numeric: self.checked_numeric,
             ownership_operations: self.ownership_operations,
+            match_arms: self.match_arms,
+            rejected_coverage: self.rejected_coverage,
             bodies: self.bodies,
             transfers: self.transfers.into_boxed_slice(),
             callable_instances: self.callable_instances.into_boxed_slice(),
@@ -80,6 +82,7 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             FactState::Unperformed | FactState::NotApplicable => return Ok(()),
         };
         let previous_owner = self.current_owner.replace(declaration);
+        let unavailable = self.recorder.unavailable_count();
         let result = (|| {
             match signature {
                 DeclarationSignature::Callable(callable) => {
@@ -98,6 +101,9 @@ impl<'input, 'hir, 'support> BodyChecker<'input, 'hir, 'support> {
             Ok(())
         })();
         self.current_owner = previous_owner;
+        if self.recorder.unavailable_count() != unavailable {
+            self.rejected_coverage.withhold_body(declaration);
+        }
         #[cfg(test)]
         if let Some(fact) = self.bodies.recorded_state(&declaration) {
             execution::tests::sweep_support::published_body(declaration, fact);
