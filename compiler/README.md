@@ -131,10 +131,11 @@ A consuming pattern binds an owned value only after its guard succeeds. If
 the guard returns or propagates an error out of the match, the checker
 verifies that it cannot leave an owned payload behind.
 
-The checker cannot yet follow later arms when a guard has no normal result or
-when a false guard changes an outer root or reference. It reports
-`typecheck.complete_ownership_flow` at that callable. An incomplete body
-prevents the program from sealing, but checked siblings keep their diagnostics.
+If a guard always exits the match, values that miss its pattern can still
+reach later arms. If a guard can return `false` after changing an outer root
+or reference, the checker reports `typecheck.complete_ownership_flow` for
+that callable. An incomplete body prevents the program from sealing, but
+checked siblings keep their diagnostics.
 Loops and closures stop earlier, during body typing.
 
 `SupportProfile::tensor_constructors_v1()` adds static checks for positional
