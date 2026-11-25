@@ -1,9 +1,11 @@
+use std::rc::Rc;
+
 use super::*;
 use eglur_hir::MatchArm;
 
 enum Branch<'hir> {
     Expression(ExprId),
-    MatchArm(&'hir MatchArm, BTreeSet<MutableRoot>),
+    MatchArm(&'hir MatchArm, Rc<BTreeSet<MutableRoot>>),
     Unchanged,
 }
 
@@ -16,9 +18,9 @@ enum Step<'hir> {
     Escape(ExprId),
     Match(ExprId, &'hir [MatchArm]),
     Fork(Vec<Branch<'hir>>),
-    StartBranch(FlowState, Branch<'hir>),
+    StartBranch(Branch<'hir>),
     FinishBranch,
-    Join(usize),
+    Join,
 }
 
 impl BodyCollector<'_> {
@@ -28,7 +30,6 @@ impl BodyCollector<'_> {
         state: &mut FlowState,
     ) -> Result<(), EffectBodyError> {
         let mut pending = vec![Step::Expression(expression)];
-        let mut completed_branches = Vec::new();
         while let Some(step) = pending.pop() {
             match step {
                 Step::Expression(id) => self.schedule_expression(id, &mut pending)?,
@@ -39,7 +40,7 @@ impl BodyCollector<'_> {
                         || Ok(BTreeSet::new()),
                         |id| self.expression_roots(id, state),
                     )?;
-                    self.bind_aliases(pattern, roots, state)?;
+                    self.bind_aliases(pattern, &roots, state)?;
                 }
                 Step::Assign(origin, target, value) => {
                     self.finish_assignment(origin, target, value, state)?;
@@ -48,47 +49,37 @@ impl BodyCollector<'_> {
                 Step::Match(scrutinee, arms) => {
                     let roots = self.expression_roots(scrutinee, state)?;
                     if !arms.is_empty() {
+                        let roots = Rc::new(roots);
                         pending.push(Step::Fork(
                             arms.iter()
-                                .map(|arm| Branch::MatchArm(arm, roots.clone()))
+                                .map(|arm| Branch::MatchArm(arm, Rc::clone(&roots)))
                                 .collect(),
                         ));
                     }
                 }
                 Step::Fork(branches) => {
-                    let entry = state.clone();
-                    pending.push(Step::Join(branches.len()));
+                    state.begin_fork(branches.len());
+                    pending.push(Step::Join);
                     for branch in branches.into_iter().rev() {
                         pending.push(Step::FinishBranch);
-                        pending.push(Step::StartBranch(entry.clone(), branch));
+                        pending.push(Step::StartBranch(branch));
                     }
                 }
-                Step::StartBranch(entry, branch) => {
-                    *state = entry;
-                    match branch {
-                        Branch::Expression(id) => pending.push(Step::Expression(id)),
-                        Branch::MatchArm(arm, roots) => {
-                            self.bind_aliases(arm.pattern, roots, state)?;
-                            pending.push(Step::Expression(arm.value));
-                            if let Some(guard) = &arm.guard {
-                                pending.push(Step::Expression(guard.condition));
-                            }
+                Step::StartBranch(branch) => match branch {
+                    Branch::Expression(id) => pending.push(Step::Expression(id)),
+                    Branch::MatchArm(arm, roots) => {
+                        self.bind_aliases(arm.pattern, &roots, state)?;
+                        pending.push(Step::Expression(arm.value));
+                        if let Some(guard) = &arm.guard {
+                            pending.push(Step::Expression(guard.condition));
                         }
-                        Branch::Unchanged => {}
                     }
-                }
-                Step::FinishBranch => completed_branches.push(std::mem::take(state)),
-                Step::Join(count) => {
-                    // Nested forks consume only their own completed branch states.
-                    let start = completed_branches
-                        .len()
-                        .checked_sub(count)
-                        .expect("scheduled branches have completed");
-                    *state = FlowState::join(completed_branches.drain(start..));
-                }
+                    Branch::Unchanged => {}
+                },
+                Step::FinishBranch => state.finish_arm(),
+                Step::Join => state.finish_fork(),
             }
         }
-        debug_assert!(completed_branches.is_empty());
         Ok(())
     }
 
