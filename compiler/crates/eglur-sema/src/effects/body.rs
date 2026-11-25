@@ -1,4 +1,7 @@
+mod flow;
 mod traversal;
+
+use flow::FlowState;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -146,42 +149,6 @@ impl EffectBody {
 
     pub(super) fn operations(&self) -> &[EffectOperation] {
         &self.operations
-    }
-}
-
-#[derive(Clone, Default)]
-struct FlowState {
-    aliases: BTreeMap<LocalBindingId, BTreeSet<MutableRoot>>,
-    escaped: BTreeSet<LocalBindingId>,
-}
-
-impl FlowState {
-    fn join(states: impl IntoIterator<Item = Self>) -> Self {
-        let mut joined = Self::default();
-        for state in states {
-            for (binding, roots) in state.aliases {
-                joined.aliases.entry(binding).or_default().extend(roots);
-            }
-            joined.escaped.extend(state.escaped);
-        }
-        joined
-    }
-
-    fn mark_escaping(&mut self, roots: impl IntoIterator<Item = MutableRoot>) {
-        self.escaped.extend(roots.into_iter().filter_map(|root| {
-            if let MutableRoot::Local(binding) = root {
-                Some(binding)
-            } else {
-                None
-            }
-        }));
-    }
-
-    fn account_for_escape(&self, root: MutableRoot) -> MutableRoot {
-        match root {
-            MutableRoot::Local(binding) if self.escaped.contains(&binding) => MutableRoot::Nonlocal,
-            other => other,
-        }
     }
 }
 
@@ -495,7 +462,7 @@ impl BodyCollector<'_> {
     fn bind_aliases(
         &self,
         pattern: PatternId,
-        initializer_roots: BTreeSet<MutableRoot>,
+        initializer_roots: &BTreeSet<MutableRoot>,
         state: &mut FlowState,
     ) -> Result<(), EffectBodyError> {
         let bindings = self
@@ -508,7 +475,7 @@ impl BodyCollector<'_> {
                 } else {
                     initializer_roots.clone()
                 };
-                state.aliases.insert(binding, roots);
+                state.rebind(binding, roots);
             }
         }
         Ok(())
@@ -531,7 +498,7 @@ impl BodyCollector<'_> {
         };
         if self.binding_is_reference(*binding)? {
             let roots = self.expression_roots(value, state)?;
-            state.aliases.insert(
+            state.rebind(
                 *binding,
                 if roots.is_empty() {
                     BTreeSet::from([MutableRoot::Unknown])
@@ -586,7 +553,7 @@ impl BodyCollector<'_> {
                     crate::TypedPlaceKind::Local(binding) => {
                         if self.boundary_parameters.contains(binding) {
                             roots.insert(MutableRoot::Boundary(*binding));
-                        } else if let Some(aliases) = state.aliases.get(binding) {
+                        } else if let Some(aliases) = state.alias_roots(*binding) {
                             roots.extend(aliases.iter().cloned());
                         } else {
                             roots.insert(MutableRoot::Local(*binding));
